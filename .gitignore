@@ -1,0 +1,6 @@
+conf/
+html/
+objs/
+man/
+nginx/
+.idea/

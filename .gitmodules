@@ -1,93 +1,12 @@
 [submodule "module/nchan"]
 	path = module/nchan
 	url = https://github.com/slact/nchan.git
-[submodule "module/nginx-upsync-module"]
-	path = module/nginx-upsync-module
-	url = https://github.com/weibocom/nginx-upsync-module.git
-[submodule "module/ngx-http-auth-jwt-module"]
-	path = module/ngx-http-auth-jwt-module
-	url = https://github.com/TeslaGov/ngx-http-auth-jwt-module.git
-[submodule "lua/lua-resty-checkups"]
-	path = lua/lua-resty-checkups
-	url = https://github.com/upyun/lua-resty-checkups.git
-[submodule "lua/lua-resty-sync"]
-	path = lua/lua-resty-sync
-	url = https://github.com/upyun/lua-resty-sync.git
-[submodule "lua/slardar"]
-	path = lua/slardar
-	url = https://github.com/upyun/slardar.git
-[submodule "module/naxsi"]
-	path = module/naxsi
-	url = https://github.com/nbs-system/naxsi.git
-[submodule "lua/kong"]
-	path = lua/kong
-	url = https://github.com/Kong/kong.git
-[submodule "lua/openstar"]
-	path = lua/openstar
-	url = https://github.com/starjun/openstar.git
-[submodule "lua/openwaf"]
-	path = lua/openwaf
-	url = https://github.com/titansec/OpenWAF.git
-[submodule "module/nginx-module-vts"]
-	path = module/nginx-module-vts
-	url = https://github.com/vozlt/nginx-module-vts.git
-[submodule "module/nginx-module-stream-sts"]
-	path = module/nginx-module-stream-sts
-	url = https://github.com/vozlt/nginx-module-stream-sts.git
-[submodule "module/echo-nginx-module"]
-	path = module/echo-nginx-module
-	url = https://github.com/openresty/echo-nginx-module.git
-[submodule "module/redis2-nginx-module"]
-	path = module/redis2-nginx-module
-	url = git@github.com:openresty/redis2-nginx-module.git
-[submodule "module/ngx_http_proxy_connect_module"]
-	path = module/ngx_http_proxy_connect_module
-	url = git@github.com:chobits/ngx_http_proxy_connect_module.git
-[submodule "lua/lua-resty-http"]
-	path = lua/lua-resty-http
-	url = https://github.com/pintsized/lua-resty-http.git
-[submodule "module/ngx_log_if"]
-	path = module/ngx_log_if
-	url = git@github.com:cfsego/ngx_log_if.git
-[submodule "module/nginx-limit-upstream"]
-	path = module/nginx-limit-upstream
-	url = https://github.com/cfsego/ngx_log_if.git
-[submodule "module/ngx_http_dyups_module"]
-	path = module/ngx_http_dyups_module
-	url = https://github.com/yzprofile/ngx_http_dyups_module.git
-[submodule "module/http-parser"]
-	path = module/http-parser
-	url = https://github.com/nodejs/http-parser.git
-[submodule "module/nginx_tcp_proxy_module"]
-	path = module/nginx_tcp_proxy_module
-	url = https://github.com/yaoweibin/nginx_tcp_proxy_module.git
-[submodule "module/ngx_sync_msg_module"]
-	path = module/ngx_sync_msg_module
-	url = https://github.com/yzprofile/ngx_sync_msg_module.git
-[submodule "module/nginx-hmux-module"]
-	path = module/nginx-hmux-module
-	url = https://github.com/wangbin579/nginx-hmux-module.git
-[submodule "module/nginx-module-url"]
-	path = module/nginx-module-url
-	url = git@github.com:vozlt/nginx-module-url.git
-[submodule "module/stream-echo-nginx-module"]
-	path = module/stream-echo-nginx-module
-	url = https://github.com/openresty/stream-echo-nginx-module.git
-[submodule "module/ngx_dynamic_limit_req_module"]
-	path = module/ngx_dynamic_limit_req_module
-	url = https://github.com/limithit/ngx_dynamic_limit_req_module.git
-[submodule "module/traffic-accounting-nginx-module"]
-	path = module/traffic-accounting-nginx-module
-	url = https://github.com/Lax/traffic-accounting-nginx-module.git
-[submodule "module/healthcheck_nginx_upstreams"]
-	path = module/healthcheck_nginx_upstreams
-	url = https://github.com/cep21/healthcheck_nginx_upstreams.git
-[submodule "module/nginx-push-stream-module"]
-	path = module/nginx-push-stream-module
-	url = https://github.com/wandenberg/nginx-push-stream-module.git
 [submodule "lua/ABTestingGateway"]
 	path = lua/ABTestingGateway
 	url = https://github.com/CNSRE/ABTestingGateway.git
-[submodule "module/nginx-upconf-module"]
-	path = module/nginx-upconf-module
-	url = https://github.com/xiaokai-wang/nginx-upconf-module.git
+[submodule "module/nginx-upsync-module"]
+	path = module/nginx-upsync-module
+	url = https://github.com/weibocom/nginx-upsync-module.git
+[submodule "module/nginx_tcp_proxy_module"]
+	path = module/nginx_tcp_proxy_module
+	url = https://github.com/yaoweibin/nginx_tcp_proxy_module.git

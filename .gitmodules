@@ -13,3 +13,6 @@
 [submodule "module/stream-echo-nginx-module"]
 	path = module/stream-echo-nginx-module
 	url = https://github.com/openresty/stream-echo-nginx-module.git
+[submodule "module/nginx-upconf-module"]
+	path = module/nginx-upconf-module
+	url = https://github.com/xiaokai-wang/nginx-upconf-module.git

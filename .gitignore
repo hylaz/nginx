@@ -3,6 +3,5 @@ html/
 objs/
 man/
 nginx/
-module/
 deps/
 .idea/

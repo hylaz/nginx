@@ -16,3 +16,6 @@
 [submodule "module/nginx-upconf-module"]
 	path = module/nginx-upconf-module
 	url = https://github.com/xiaokai-wang/nginx-upconf-module.git
+[submodule "module/ngx_sync_msg_module"]
+	path = module/ngx_sync_msg_module
+	url = https://github.com/yzprofile/ngx_sync_msg_module.git

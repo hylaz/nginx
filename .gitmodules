@@ -15,6 +15,7 @@
 	url = https://github.com/openresty/stream-echo-nginx-module.git
 [submodule "module/nginx-upconf-module"]
 	path = module/nginx-upconf-module
+	ignore=all
 	url = https://github.com/xiaokai-wang/nginx-upconf-module.git
 [submodule "module/ngx_sync_msg_module"]
 	path = module/ngx_sync_msg_module

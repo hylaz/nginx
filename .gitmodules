@@ -38,3 +38,11 @@
 	ignore=all
 	path = lua/lua-resty-sync
 	url = https://github.com/upyun/lua-resty-sync.git
+[submodule "lua/proxygateway"]
+	ignore=all
+	path = lua/proxygateway
+	url = https://github.com/ffay/proxygateway.git
+[submodule "module/headers-more-nginx-module"]
+	ignore=all
+	path = module/headers-more-nginx-module
+	url = https://github.com/openresty/headers-more-nginx-module.git

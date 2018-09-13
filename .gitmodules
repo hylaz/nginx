@@ -34,3 +34,7 @@
 	ignore=all
 	path = module/ngx_http_proxy_connect_module
 	url = git@github.com:chobits/ngx_http_proxy_connect_module.git
+[submodule "lua/lua-resty-sync"]
+	ignore=all
+	path = lua/lua-resty-sync
+	url = https://github.com/upyun/lua-resty-sync.git

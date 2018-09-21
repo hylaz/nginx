@@ -47,5 +47,10 @@
 	path = module/headers-more-nginx-module
 	url = https://github.com/openresty/headers-more-nginx-module.git
 [submodule "module/traffic-accounting-nginx-module"]
+	ignore=all
 	path = module/traffic-accounting-nginx-module
 	url = https://github.com/Lax/traffic-accounting-nginx-module.git
+[submodule "lua/kong"]
+	ignore=all
+	path = lua/kong
+	url = https://github.com/Kong/kong.git

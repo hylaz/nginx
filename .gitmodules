@@ -54,3 +54,6 @@
 	ignore=all
 	path = lua/kong
 	url = https://github.com/Kong/kong.git
+[submodule "module/ngx_dynamic_limit_req_module"]
+	path = module/ngx_dynamic_limit_req_module
+	url = https://github.com/limithit/ngx_dynamic_limit_req_module.git

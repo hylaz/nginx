@@ -55,5 +55,26 @@
 	path = lua/kong
 	url = https://github.com/Kong/kong.git
 [submodule "module/ngx_dynamic_limit_req_module"]
+	ignore=all
 	path = module/ngx_dynamic_limit_req_module
 	url = https://github.com/limithit/ngx_dynamic_limit_req_module.git
+[submodule "lua/openstar"]
+	ignore=all
+	path = lua/openstar
+	url = https://github.com/starjun/openstar.git
+[submodule "lua/slardar"]
+	path = lua/slardar
+	ignore=all
+	url = https://github.com/upyun/slardar.git
+[submodule "module/nginx_http_upstream_check_module"]
+	ignore=all
+	path = module/nginx_http_upstream_check_module
+	url = https://github.com/yaoweibin/nginx_upstream_check_module.git
+[submodule "module/naxsi"]
+	ignore=all
+	path = module/naxsi
+	url = https://github.com/nbs-system/naxsi.git
+[submodule "module/nginx-limit-upstream"]
+	ignore=all
+	path = module/nginx-limit-upstream
+	url = https://github.com/cfsego/nginx-limit-upstream.git

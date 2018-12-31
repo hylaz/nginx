@@ -78,3 +78,15 @@
 	ignore=all
 	path = module/nginx-limit-upstream
 	url = https://github.com/cfsego/nginx-limit-upstream.git
+[submodule "module/unit"]
+	path = module/unit
+	ignore=all
+	url = https://github.com/nginx/unit.git
+[submodule "plugins/nginx"]
+	path = plugins/nginx
+	ignore=all
+	url = https://github.com/nginxinc/NGINX-Demos.git
+[submodule "plugins/nginmesh"]
+	path = plugins/nginmesh
+	ignore=all
+	url = https://github.com/nginxinc/nginmesh.git

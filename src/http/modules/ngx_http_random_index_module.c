@@ -256,7 +256,9 @@ ngx_http_random_index_handler(ngx_http_request_t *r)
     return ngx_http_internal_redirect(r, &uri, &r->args);
 }
 
-
+/**
+ * 服务器目录错误
+ */ 
 static ngx_int_t
 ngx_http_random_index_error(ngx_http_request_t *r, ngx_dir_t *dir,
     ngx_str_t *name)
@@ -269,7 +271,9 @@ ngx_http_random_index_error(ngx_http_request_t *r, ngx_dir_t *dir,
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
 }
 
-
+/**
+ * 初始化loc结构体
+ */ 
 static void *
 ngx_http_random_index_create_loc_conf(ngx_conf_t *cf)
 {
@@ -285,7 +289,9 @@ ngx_http_random_index_create_loc_conf(ngx_conf_t *cf)
     return conf;
 }
 
-
+/**
+ * 合并结构体
+ */ 
 static char *
 ngx_http_random_index_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -297,7 +303,9 @@ ngx_http_random_index_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * 初始化模块
+ */ 
 static ngx_int_t
 ngx_http_random_index_init(ngx_conf_t *cf)
 {

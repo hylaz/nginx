@@ -2758,7 +2758,9 @@ ngx_http_upstream_process_headers(ngx_http_request_t *r, ngx_http_upstream_t *u)
                 ngx_http_finalize_request(r, NGX_HTTP_NOT_FOUND);
                 return NGX_DONE;
             }
-
+            /**
+             * 
+             */ 
             if (r->method != NGX_HTTP_HEAD) {
                 r->method = NGX_HTTP_GET;
                 r->method_name = ngx_http_core_get_method;
@@ -2888,7 +2890,9 @@ ngx_http_upstream_process_trailers(ngx_http_request_t *r,
     return NGX_OK;
 }
 
-
+/**
+ * 发送回应数据
+ */ 
 static void
 ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
 {
@@ -2897,7 +2901,9 @@ ngx_http_upstream_send_response(ngx_http_request_t *r, ngx_http_upstream_t *u)
     ngx_event_pipe_t          *p;
     ngx_connection_t          *c;
     ngx_http_core_loc_conf_t  *clcf;
-
+    /**
+     * 发送请求头部
+     */ 
     rc = ngx_http_send_header(r);
 
     if (rc == NGX_ERROR || rc > NGX_OK || r->post_action) {
@@ -3288,21 +3294,28 @@ ngx_http_upstream_upgrade(ngx_http_request_t *r, ngx_http_upstream_t *u)
     ngx_http_upstream_process_upgraded(r, 0, 1);
 }
 
-
+/**
+ * 处理下游读请求
+ */ 
 static void
 ngx_http_upstream_upgraded_read_downstream(ngx_http_request_t *r)
 {
     ngx_http_upstream_process_upgraded(r, 0, 0);
 }
 
-
+/**
+ * 处理下游写请求
+ * 
+ */ 
 static void
 ngx_http_upstream_upgraded_write_downstream(ngx_http_request_t *r)
 {
     ngx_http_upstream_process_upgraded(r, 1, 1);
 }
 
-
+/**
+ * 处理上游读请求
+ */ 
 static void
 ngx_http_upstream_upgraded_read_upstream(ngx_http_request_t *r,
     ngx_http_upstream_t *u)
@@ -3310,7 +3323,9 @@ ngx_http_upstream_upgraded_read_upstream(ngx_http_request_t *r,
     ngx_http_upstream_process_upgraded(r, 1, 0);
 }
 
-
+/**
+ * 处理上游写请求
+ */ 
 static void
 ngx_http_upstream_upgraded_write_upstream(ngx_http_request_t *r,
     ngx_http_upstream_t *u)
@@ -3496,7 +3511,9 @@ ngx_http_upstream_process_upgraded(ngx_http_request_t *r,
     }
 }
 
-
+/**
+ * 发送下游数据处理
+ */ 
 static void
 ngx_http_upstream_process_non_buffered_downstream(ngx_http_request_t *r)
 {
@@ -3523,7 +3540,9 @@ ngx_http_upstream_process_non_buffered_downstream(ngx_http_request_t *r)
     ngx_http_upstream_process_non_buffered_request(r, 1);
 }
 
-
+/**
+ * 读取上游的数据
+ */ 
 static void
 ngx_http_upstream_process_non_buffered_upstream(ngx_http_request_t *r,
     ngx_http_upstream_t *u)
@@ -3546,7 +3565,9 @@ ngx_http_upstream_process_non_buffered_upstream(ngx_http_request_t *r,
     ngx_http_upstream_process_non_buffered_request(r, 0);
 }
 
-
+/**
+ * 读取上游数据
+ */ 
 static void
 ngx_http_upstream_process_non_buffered_request(ngx_http_request_t *r,
     ngx_uint_t do_write)
@@ -3641,7 +3662,9 @@ ngx_http_upstream_process_non_buffered_request(ngx_http_request_t *r,
     }
 
     clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
-
+    /**
+     * 下游数据处理
+     */ 
     if (downstream->data == r) {
         if (ngx_handle_write_event(downstream->write, clcf->send_lowat)
             != NGX_OK)
@@ -3671,14 +3694,18 @@ ngx_http_upstream_process_non_buffered_request(ngx_http_request_t *r,
     }
 }
 
-
+/**
+ * 过滤模块默认初始化
+ */ 
 static ngx_int_t
 ngx_http_upstream_non_buffered_filter_init(void *data)
 {
     return NGX_OK;
 }
 
-
+/**
+ * 过滤模块
+ */ 
 static ngx_int_t
 ngx_http_upstream_non_buffered_filter(void *data, ssize_t bytes)
 {
@@ -3803,7 +3830,9 @@ ngx_http_upstream_thread_event_handler(ngx_event_t *ev)
 
 #endif
 
-
+/**
+ * 输出过滤模块
+ */ 
 static ngx_int_t
 ngx_http_upstream_output_filter(void *data, ngx_chain_t *chain)
 {
@@ -3821,7 +3850,9 @@ ngx_http_upstream_output_filter(void *data, ngx_chain_t *chain)
     return rc;
 }
 
-
+/**
+ * 处理下游请求
+ */ 
 static void
 ngx_http_upstream_process_downstream(ngx_http_request_t *r)
 {
@@ -3873,7 +3904,9 @@ ngx_http_upstream_process_downstream(ngx_http_request_t *r)
     ngx_http_upstream_process_request(r, u);
 }
 
-
+/**
+ * 处理上游请求
+ */ 
 static void
 ngx_http_upstream_process_upstream(ngx_http_request_t *r,
     ngx_http_upstream_t *u)
@@ -3919,7 +3952,9 @@ ngx_http_upstream_process_upstream(ngx_http_request_t *r,
     ngx_http_upstream_process_request(r, u);
 }
 
-
+/**
+ * 处理请求
+ */ 
 static void
 ngx_http_upstream_process_request(ngx_http_request_t *r,
     ngx_http_upstream_t *u)
@@ -4028,7 +4063,9 @@ ngx_http_upstream_process_request(ngx_http_request_t *r,
     }
 }
 
-
+/**
+ * 处理上游存储
+ */ 
 static void
 ngx_http_upstream_store(ngx_http_request_t *r, ngx_http_upstream_t *u)
 {
@@ -4109,7 +4146,9 @@ ngx_http_upstream_store(ngx_http_request_t *r, ngx_http_upstream_t *u)
     u->store = 0;
 }
 
-
+/**
+ * 上游写事件
+ */ 
 static void
 ngx_http_upstream_dummy_handler(ngx_http_request_t *r, ngx_http_upstream_t *u)
 {
@@ -4117,7 +4156,9 @@ ngx_http_upstream_dummy_handler(ngx_http_request_t *r, ngx_http_upstream_t *u)
                    "http upstream dummy handler");
 }
 
-
+/**
+ * 下部处理事件
+ */ 
 static void
 ngx_http_upstream_next(ngx_http_request_t *r, ngx_http_upstream_t *u,
     ngx_uint_t ft_type)
@@ -4281,7 +4322,9 @@ ngx_http_upstream_cleanup(void *data)
     ngx_http_upstream_finalize_request(r, r->upstream, NGX_DONE);
 }
 
-
+/**
+ * 结束请求
+ */ 
 static void
 ngx_http_upstream_finalize_request(ngx_http_request_t *r,
     ngx_http_upstream_t *u, ngx_int_t rc)
@@ -4304,7 +4347,9 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
         ngx_resolve_name_done(u->resolved->ctx);
         u->resolved->ctx = NULL;
     }
-
+    /**
+     * 更新上游回应时间
+     */ 
     if (u->state && u->state->response_time) {
         u->state->response_time = ngx_current_msec - u->state->response_time;
 
@@ -4314,7 +4359,9 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
             u->state->response_length = u->pipe->read_length;
         }
     }
-
+    /**
+     * 回调结束请求
+     */ 
     u->finalize_request(r, rc);
 
     if (u->peer.free && u->peer.sockaddr) {
@@ -4345,11 +4392,13 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                        "close http upstream connection: %d",
                        u->peer.connection->fd);
-
+        /**
+         * 销毁连接池
+         */ 
         if (u->peer.connection->pool) {
             ngx_destroy_pool(u->peer.connection->pool);
         }
-
+        //关闭请求
         ngx_close_connection(u->peer.connection);
     }
 
@@ -4395,7 +4444,7 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
     }
 
 #endif
-
+    
     r->read_event_handler = ngx_http_block_reading;
 
     if (rc == NGX_DECLINED) {
@@ -4403,7 +4452,9 @@ ngx_http_upstream_finalize_request(ngx_http_request_t *r,
     }
 
     r->connection->log->action = "sending to client";
-
+    /**
+     * 如果没有发送头部请求
+     */ 
     if (!u->header_sent
         || rc == NGX_HTTP_REQUEST_TIME_OUT
         || rc == NGX_HTTP_CLIENT_CLOSED_REQUEST)

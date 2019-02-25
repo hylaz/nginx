@@ -1407,7 +1407,10 @@ ngx_connection_local_sockaddr(ngx_connection_t *c, ngx_str_t *s,
     return NGX_OK;
 }
 
-
+/**
+ * CP_NODELAY选项是用来控制是否开启Nagle算法，
+ * 该算法是为了提高较慢的广域网传输效率，减小小分组的报文个数
+ */ 
 ngx_int_t
 ngx_tcp_nodelay(ngx_connection_t *c)
 {

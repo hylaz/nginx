@@ -655,7 +655,9 @@ ngx_create_paths(ngx_cycle_t *cycle, ngx_uid_t user)
     return NGX_OK;
 }
 
-
+/**
+ * 重命名文件
+ */ 
 ngx_int_t
 ngx_ext_rename_file(ngx_str_t *src, ngx_str_t *to, ngx_ext_rename_file_t *ext)
 {

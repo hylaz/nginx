@@ -2394,7 +2394,9 @@ ngx_http_subrequest(ngx_http_request_t *r,
     return ngx_http_post_request(sr, NULL);
 }
 
-
+/**
+ * 内部跳转
+ */ 
 ngx_int_t
 ngx_http_internal_redirect(ngx_http_request_t *r,
     ngx_str_t *uri, ngx_str_t *args)

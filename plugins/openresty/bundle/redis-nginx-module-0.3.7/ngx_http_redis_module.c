@@ -753,7 +753,9 @@ ngx_http_redis_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
     return;
 }
 
-
+/**
+ * 创建ngx_http_redis_loc_conf_t结构体
+ */ 
 static void *
 ngx_http_redis_create_loc_conf(ngx_conf_t *cf)
 {
@@ -812,7 +814,9 @@ ngx_http_redis_create_loc_conf(ngx_conf_t *cf)
     return conf;
 }
 
-
+/**
+ * 合并ngx_http_redis_loc_conf_t结构体
+ */ 
 static char *
 ngx_http_redis_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -874,7 +878,9 @@ ngx_http_redis_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * redis_pass配置
+ */ 
 static char *
 ngx_http_redis_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -955,7 +961,9 @@ ngx_http_redis_reset_variable(ngx_http_request_t *r,
     return NGX_OK;
 }
 
-
+/**
+ * 添加变量
+ */ 
 static ngx_int_t
 ngx_http_redis_add_variables(ngx_conf_t *cf)
 {

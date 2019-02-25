@@ -43,7 +43,9 @@ ngx_module_t  ngx_http_write_filter_module = {
     NGX_MODULE_V1_PADDING
 };
 
-
+/**
+ * 过滤函数
+ */ 
 ngx_int_t
 ngx_http_write_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
@@ -317,7 +319,9 @@ ngx_http_write_filter(ngx_http_request_t *r, ngx_chain_t *in)
     return NGX_OK;
 }
 
-
+/**
+ * 初始化模块
+ */ 
 static ngx_int_t
 ngx_http_write_filter_init(ngx_conf_t *cf)
 {

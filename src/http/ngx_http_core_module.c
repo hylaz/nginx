@@ -1733,7 +1733,9 @@ ngx_http_send_response(ngx_http_request_t *r, ngx_uint_t status,
     return ngx_http_output_filter(r, &out);
 }
 
-
+/**
+ * 发送header信息
+ */ 
 ngx_int_t
 ngx_http_send_header(ngx_http_request_t *r)
 {
@@ -2447,7 +2449,9 @@ ngx_http_internal_redirect(ngx_http_request_t *r,
     return NGX_DONE;
 }
 
-
+/**
+ * 内部跳转
+ */ 
 ngx_int_t
 ngx_http_named_location(ngx_http_request_t *r, ngx_str_t *name)
 {

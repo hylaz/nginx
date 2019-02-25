@@ -30,7 +30,9 @@
 typedef void (*ngx_pool_cleanup_pt)(void *data);
 
 typedef struct ngx_pool_cleanup_s  ngx_pool_cleanup_t;
-
+/**
+ * 清除内存池
+ */ 
 struct ngx_pool_cleanup_s {
     ngx_pool_cleanup_pt   handler;
     void                 *data;

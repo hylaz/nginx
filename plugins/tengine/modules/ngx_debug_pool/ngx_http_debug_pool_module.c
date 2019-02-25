@@ -55,7 +55,9 @@ ngx_module_t  ngx_http_debug_pool_module = {
     NGX_MODULE_V1_PADDING
 };
 
-
+/**
+ * 配置处理函数
+ */ 
 static ngx_int_t
 ngx_http_debug_pool_handler(ngx_http_request_t *r)
 {
@@ -96,7 +98,9 @@ ngx_http_debug_pool_handler(ngx_http_request_t *r)
     return ngx_http_output_filter(r, &out);
 }
 
-
+/**
+ * debug pool 内存池的内容
+ */ 
 static ngx_int_t
 ngx_http_debug_pool_buf(ngx_pool_t *pool, ngx_buf_t *b)
 {
@@ -161,7 +165,9 @@ ngx_http_debug_pool_buf(ngx_pool_t *pool, ngx_buf_t *b)
     return NGX_OK;
 }
 
-
+/**
+ * 解析debug_pool配置项
+ */ 
 static char *
 ngx_http_debug_pool(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {

@@ -21,7 +21,9 @@ static ngx_pool_stat_t  ngx_pool_default_stat = {
 
 ngx_pool_stat_t *ngx_pool_stats[NGX_POOL_STATS_MAX] = { NULL };
 ngx_int_t        ngx_pool_stats_num = 0;
-
+/**
+ * 初始化pstat
+ */ 
 static ngx_pool_stat_t *
 ngx_pstat(u_char *func)
 {
@@ -102,7 +104,9 @@ ngx_create_pool(size_t size, ngx_log_t *log)
     return p;
 }
 
-
+/**
+ * 销毁内存池
+ */ 
 void
 ngx_destroy_pool(ngx_pool_t *pool)
 {
@@ -162,7 +166,9 @@ ngx_destroy_pool(ngx_pool_t *pool)
     }
 }
 
-
+/**
+ * 重置内存池
+ */ 
 void
 ngx_reset_pool(ngx_pool_t *pool)
 {
@@ -188,7 +194,9 @@ ngx_reset_pool(ngx_pool_t *pool)
     pool->large = NULL;
 }
 
-
+/**
+ * 内存池申请
+ */ 
 void *
 ngx_palloc(ngx_pool_t *pool, size_t size)
 {
@@ -218,7 +226,9 @@ ngx_palloc(ngx_pool_t *pool, size_t size)
     return ngx_palloc_large(pool, size);
 }
 
-
+/**
+ * 重新申请
+ */
 void *
 ngx_pnalloc(ngx_pool_t *pool, size_t size)
 {
@@ -248,7 +258,9 @@ ngx_pnalloc(ngx_pool_t *pool, size_t size)
     return ngx_palloc_large(pool, size);
 }
 
-
+/**
+ * 申请内存块
+ */ 
 static void *
 ngx_palloc_block(ngx_pool_t *pool, size_t size)
 {
@@ -288,7 +300,9 @@ ngx_palloc_block(ngx_pool_t *pool, size_t size)
     return m;
 }
 
-
+/**
+ * 申请大块内存
+ */ 
 static void *
 ngx_palloc_large(ngx_pool_t *pool, size_t size)
 {
@@ -368,7 +382,9 @@ ngx_pmemalign(ngx_pool_t *pool, size_t size, size_t alignment)
     return p;
 }
 
-
+/**
+ * 释放内存块
+ */ 
 ngx_int_t
 ngx_pfree(ngx_pool_t *pool, void *p)
 {
@@ -392,7 +408,9 @@ ngx_pfree(ngx_pool_t *pool, void *p)
     return NGX_DECLINED;
 }
 
-
+/**
+ * 重新申请内存
+ */ 
 void *
 ngx_pcalloc(ngx_pool_t *pool, size_t size)
 {
@@ -473,7 +491,9 @@ ngx_pool_cleanup_file(void *data)
     }
 }
 
-
+/**
+ * 删除文件
+ */ 
 void
 ngx_pool_delete_file(void *data)
 {

@@ -229,7 +229,9 @@ ngx_ssl_init(ngx_log_t *log)
     return NGX_OK;
 }
 
-
+/**
+ * 创建ssl
+ */ 
 ngx_int_t
 ngx_ssl_create(ngx_ssl_t *ssl, ngx_uint_t protocols, void *data)
 {
@@ -902,7 +904,9 @@ ngx_ssl_rsa512_key_callback(ngx_ssl_conn_t *ssl_conn, int is_export,
     return key;
 }
 
-
+/**
+ * 读取password_file文件
+ */ 
 ngx_array_t *
 ngx_ssl_read_password_file(ngx_conf_t *cf, ngx_str_t *file)
 {
@@ -3427,7 +3431,9 @@ ngx_ssl_check_name(ngx_str_t *name, ASN1_STRING *pattern)
 
 #endif
 
-
+/**
+ * ssl_protocol
+ */ 
 ngx_int_t
 ngx_ssl_get_protocol(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -3435,7 +3441,9 @@ ngx_ssl_get_protocol(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
     return NGX_OK;
 }
 
-
+/**
+ * ssl_cipher 
+ */ 
 ngx_int_t
 ngx_ssl_get_cipher_name(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -3443,7 +3451,9 @@ ngx_ssl_get_cipher_name(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
     return NGX_OK;
 }
 
-
+/**
+ * ssl_ciphers
+ */ 
 ngx_int_t
 ngx_ssl_get_ciphers(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -3527,7 +3537,9 @@ ngx_ssl_get_ciphers(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
     return NGX_OK;
 }
 
-
+/**
+ * ssl_curves
+ */ 
 ngx_int_t
 ngx_ssl_get_curves(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -3595,7 +3607,9 @@ ngx_ssl_get_curves(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
     return NGX_OK;
 }
 
-
+/**
+ * ssl_session_id
+ */ 
 ngx_int_t
 ngx_ssl_get_session_id(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -3631,7 +3645,9 @@ ngx_ssl_get_session_id(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
     return NGX_OK;
 }
 
-
+/**
+ * ssl_session_reused
+ */ 
 ngx_int_t
 ngx_ssl_get_session_reused(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -3645,7 +3661,9 @@ ngx_ssl_get_session_reused(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
     return NGX_OK;
 }
 
-
+/**
+ * ssl_early_data
+ */ 
 ngx_int_t
 ngx_ssl_get_early_data(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -3660,7 +3678,9 @@ ngx_ssl_get_early_data(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
     return NGX_OK;
 }
 
-
+/**
+ * ssl_server_name
+ */ 
 ngx_int_t
 ngx_ssl_get_server_name(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -3691,7 +3711,9 @@ ngx_ssl_get_server_name(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
     return NGX_OK;
 }
 
-
+/**
+ * ssl_client_raw_cert
+ */ 
 ngx_int_t
 ngx_ssl_get_raw_certificate(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -3741,7 +3763,9 @@ failed:
     return NGX_ERROR;
 }
 
-
+/**
+ * ssl_client_cert
+ */ 
 ngx_int_t
 ngx_ssl_get_certificate(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -3785,7 +3809,9 @@ ngx_ssl_get_certificate(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
     return NGX_OK;
 }
 
-
+/**
+ * ssl_client_escaped_cert
+ */ 
 ngx_int_t
 ngx_ssl_get_escaped_certificate(ngx_connection_t *c, ngx_pool_t *pool,
     ngx_str_t *s)
@@ -3815,7 +3841,9 @@ ngx_ssl_get_escaped_certificate(ngx_connection_t *c, ngx_pool_t *pool,
     return NGX_OK;
 }
 
-
+/**
+ * ssl_client_s_dn
+ */ 
 ngx_int_t
 ngx_ssl_get_subject_dn(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -3866,7 +3894,9 @@ failed:
     return NGX_ERROR;
 }
 
-
+/**
+ * ssl_client_i_dn
+ */ 
 ngx_int_t
 ngx_ssl_get_issuer_dn(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -3917,7 +3947,9 @@ failed:
     return NGX_ERROR;
 }
 
-
+/**
+ * ssl_client_s_dn_legacy
+ */ 
 ngx_int_t
 ngx_ssl_get_subject_dn_legacy(ngx_connection_t *c, ngx_pool_t *pool,
     ngx_str_t *s)
@@ -3960,7 +3992,9 @@ ngx_ssl_get_subject_dn_legacy(ngx_connection_t *c, ngx_pool_t *pool,
     return NGX_OK;
 }
 
-
+/**
+ * ssl_client_i_dn_legacy
+ */ 
 ngx_int_t
 ngx_ssl_get_issuer_dn_legacy(ngx_connection_t *c, ngx_pool_t *pool,
     ngx_str_t *s)
@@ -4003,7 +4037,9 @@ ngx_ssl_get_issuer_dn_legacy(ngx_connection_t *c, ngx_pool_t *pool,
     return NGX_OK;
 }
 
-
+/**
+ * ssl_client_serial
+ */ 
 ngx_int_t
 ngx_ssl_get_serial_number(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -4042,7 +4078,9 @@ ngx_ssl_get_serial_number(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
     return NGX_OK;
 }
 
-
+/**
+ * ssl_client_fingerprint
+ */ 
 ngx_int_t
 ngx_ssl_get_fingerprint(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -4076,7 +4114,9 @@ ngx_ssl_get_fingerprint(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
     return NGX_OK;
 }
 
-
+/**
+ * ssl_client_verify
+ */ 
 ngx_int_t
 ngx_ssl_get_client_verify(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -4111,7 +4151,9 @@ ngx_ssl_get_client_verify(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
     return NGX_OK;
 }
 
-
+/**
+ * ssl_client_v_start
+ */ 
 ngx_int_t
 ngx_ssl_get_client_v_start(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -4155,7 +4197,9 @@ ngx_ssl_get_client_v_start(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
     return NGX_OK;
 }
 
-
+/**
+ * ssl_client_v_end
+ */ 
 ngx_int_t
 ngx_ssl_get_client_v_end(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {
@@ -4199,7 +4243,9 @@ ngx_ssl_get_client_v_end(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
     return NGX_OK;
 }
 
-
+/**
+ * ssl_client_v_remain
+ */ 
 ngx_int_t
 ngx_ssl_get_client_v_remain(ngx_connection_t *c, ngx_pool_t *pool, ngx_str_t *s)
 {

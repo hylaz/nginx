@@ -44,7 +44,9 @@ ngx_module_t  ngx_http_static_module = {
     NGX_MODULE_V1_PADDING
 };
 
-
+/**
+ * 模块执行handler函数
+ */ 
 static ngx_int_t
 ngx_http_static_handler(ngx_http_request_t *r)
 {
@@ -268,7 +270,9 @@ ngx_http_static_handler(ngx_http_request_t *r)
     return ngx_http_output_filter(r, &out);
 }
 
-
+/**
+ * 初始化模块执行handler
+ */ 
 static ngx_int_t
 ngx_http_static_init(ngx_conf_t *cf)
 {

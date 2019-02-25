@@ -280,7 +280,9 @@ ngx_module_t  ngx_http_ssl_module = {
     NGX_MODULE_V1_PADDING
 };
 
-
+/**
+ * https 变量部分
+ */ 
 static ngx_http_variable_t  ngx_http_ssl_vars[] = {
 
     { ngx_string("ssl_protocol"), NULL, ngx_http_ssl_static_variable,
@@ -453,7 +455,9 @@ ngx_http_ssl_npn_advertised(ngx_ssl_conn_t *ssl_conn,
 
 #endif
 
-
+/**
+ * 获取变量指
+ */ 
 static ngx_int_t
 ngx_http_ssl_static_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
@@ -484,7 +488,9 @@ ngx_http_ssl_static_variable(ngx_http_request_t *r,
     return NGX_OK;
 }
 
-
+/**
+ * 获取https变量
+ */ 
 static ngx_int_t
 ngx_http_ssl_variable(ngx_http_request_t *r, ngx_http_variable_value_t *v,
     uintptr_t data)
@@ -516,7 +522,9 @@ ngx_http_ssl_variable(ngx_http_request_t *r, ngx_http_variable_value_t *v,
     return NGX_OK;
 }
 
-
+/**
+ * 添加变量
+ */ 
 static ngx_int_t
 ngx_http_ssl_add_variables(ngx_conf_t *cf)
 {
@@ -535,7 +543,9 @@ ngx_http_ssl_add_variables(ngx_conf_t *cf)
     return NGX_OK;
 }
 
-
+/**
+ * 创建ngx_http_ssl_srv_conf_t
+ */ 
 static void *
 ngx_http_ssl_create_srv_conf(ngx_conf_t *cf)
 {
@@ -580,7 +590,9 @@ ngx_http_ssl_create_srv_conf(ngx_conf_t *cf)
     return sscf;
 }
 
-
+/**
+ * 合并ngx_http_ssl_srv_conf_t配置项
+ */ 
 static char *
 ngx_http_ssl_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -830,7 +842,9 @@ ngx_http_ssl_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * ssl配置项解析
+ */ 
 static char *
 ngx_http_ssl_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -850,7 +864,9 @@ ngx_http_ssl_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * ssl_password_file 配置文件
+ */ 
 static char *
 ngx_http_ssl_password_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -873,7 +889,9 @@ ngx_http_ssl_password_file(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * ssl_session_cache配置项
+ */ 
 static char *
 ngx_http_ssl_session_cache(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -985,7 +1003,9 @@ invalid:
     return NGX_CONF_ERROR;
 }
 
-
+/**
+ * ngx_http_ssl_module初始化
+ */ 
 static ngx_int_t
 ngx_http_ssl_init(ngx_conf_t *cf)
 {
@@ -1003,7 +1023,7 @@ ngx_http_ssl_init(ngx_conf_t *cf)
     for (s = 0; s < cmcf->servers.nelts; s++) {
 
         sscf = cscfp[s]->ctx->srv_conf[ngx_http_ssl_module.ctx_index];
-
+        //非https配置
         if (sscf->ssl.ctx == NULL || !sscf->stapling) {
             continue;
         }

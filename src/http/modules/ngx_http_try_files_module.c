@@ -74,7 +74,9 @@ ngx_module_t  ngx_http_try_files_module = {
     NGX_MODULE_V1_PADDING
 };
 
-
+/**
+ * 模块执行的handler
+ */ 
 static ngx_int_t
 ngx_http_try_files_handler(ngx_http_request_t *r)
 {
@@ -286,7 +288,9 @@ ngx_http_try_files_handler(ngx_http_request_t *r)
     /* not reached */
 }
 
-
+/**
+ * try_files配置解析项
+ */ 
 static char *
 ngx_http_try_files(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -364,7 +368,9 @@ ngx_http_try_files(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * 创建ngx_http_try_files_loc_conf_t结构体
+ */ 
 static void *
 ngx_http_try_files_create_loc_conf(ngx_conf_t *cf)
 {
@@ -384,7 +390,9 @@ ngx_http_try_files_create_loc_conf(ngx_conf_t *cf)
     return tlcf;
 }
 
-
+/**
+ * try_files模块初始化
+ */ 
 static ngx_int_t
 ngx_http_try_files_init(ngx_conf_t *cf)
 {

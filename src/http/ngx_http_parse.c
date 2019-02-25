@@ -2106,7 +2106,9 @@ ngx_http_arg(ngx_http_request_t *r, u_char *name, size_t len, ngx_str_t *value)
     return NGX_DECLINED;
 }
 
-
+/**
+ * 分割uri中路径和参数
+ */ 
 void
 ngx_http_split_args(ngx_http_request_t *r, ngx_str_t *uri, ngx_str_t *args)
 {

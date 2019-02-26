@@ -331,14 +331,18 @@ ngx_stream_core_content_phase(ngx_stream_session_t *s,
     return NGX_OK;
 }
 
-
+/**
+ * 添加core变量 
+ */
 static ngx_int_t
 ngx_stream_core_preconfiguration(ngx_conf_t *cf)
 {
     return ngx_stream_variables_add_core_vars(cf);
 }
 
-
+/**
+ * 创建ngx_stream_core_main_conf_t 结构体
+ */ 
 static void *
 ngx_stream_core_create_main_conf(ngx_conf_t *cf)
 {
@@ -368,7 +372,9 @@ ngx_stream_core_create_main_conf(ngx_conf_t *cf)
     return cmcf;
 }
 
-
+/**
+ * 初始化ngx_stream_core_main_conf_t 结构体
+ */ 
 static char *
 ngx_stream_core_init_main_conf(ngx_conf_t *cf, void *conf)
 {
@@ -387,7 +393,9 @@ ngx_stream_core_init_main_conf(ngx_conf_t *cf, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * 创建ngx_stream_core_srv_conf_t结构体
+ */ 
 static void *
 ngx_stream_core_create_srv_conf(ngx_conf_t *cf)
 {
@@ -416,7 +424,9 @@ ngx_stream_core_create_srv_conf(ngx_conf_t *cf)
     return cscf;
 }
 
-
+/**
+ * 合并ngx_stream_core_srv_conf_t 结构体
+ */ 
 static char *
 ngx_stream_core_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -482,7 +492,9 @@ ngx_stream_core_error_log(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return ngx_log_set_log(cf, &cscf->error_log);
 }
 
-
+/**
+ * server配置
+ */ 
 static char *
 ngx_stream_core_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -563,7 +575,9 @@ ngx_stream_core_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return rv;
 }
 
-
+/**
+ * listen配置项
+ */ 
 static char *
 ngx_stream_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -896,7 +910,9 @@ ngx_stream_core_listen(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * resolver配置项
+ */ 
 static char *
 ngx_stream_core_resolver(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {

@@ -2301,7 +2301,9 @@ ngx_http_post_request(ngx_http_request_t *r, ngx_http_posted_request_t *pr)
     return NGX_OK;
 }
 
-
+/**
+ * http请求结束
+ */ 
 void
 ngx_http_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
 {
@@ -3353,7 +3355,9 @@ ngx_http_request_empty_handler(ngx_http_request_t *r)
     return;
 }
 
-
+/**
+ * 发送请求内容
+ */ 
 ngx_int_t
 ngx_http_send_special(ngx_http_request_t *r, ngx_uint_t flags)
 {

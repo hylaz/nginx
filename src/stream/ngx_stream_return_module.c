@@ -67,7 +67,9 @@ ngx_module_t  ngx_stream_return_module = {
     NGX_MODULE_V1_PADDING
 };
 
-
+/***
+ * 
+ */ 
 static void
 ngx_stream_return_handler(ngx_stream_session_t *s)
 {
@@ -123,13 +125,15 @@ ngx_stream_return_handler(ngx_stream_session_t *s)
 
     ctx->out->buf = b;
     ctx->out->next = NULL;
-
+    //设置write handler函数
     c->write->handler = ngx_stream_return_write_handler;
 
     ngx_stream_return_write_handler(c->write);
 }
 
-
+/**
+ * 返回数据
+ */ 
 static void
 ngx_stream_return_write_handler(ngx_event_t *ev)
 {
@@ -170,7 +174,9 @@ ngx_stream_return_write_handler(ngx_event_t *ev)
     ngx_add_timer(ev, 5000);
 }
 
-
+/**
+ * 创建ngx_stream_return_srv_conf_t 结构体
+ */ 
 static void *
 ngx_stream_return_create_srv_conf(ngx_conf_t *cf)
 {
@@ -184,7 +190,9 @@ ngx_stream_return_create_srv_conf(ngx_conf_t *cf)
     return conf;
 }
 
-
+/**
+ * return 配置项
+ */ 
 static char *
 ngx_stream_return(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {

@@ -1098,7 +1098,9 @@ ngx_stream_regex_exec(ngx_stream_session_t *s, ngx_stream_regex_t *re,
 
 #endif
 
-
+/**
+ * 添加core变量
+ */ 
 ngx_int_t
 ngx_stream_variables_add_core_vars(ngx_conf_t *cf)
 {
@@ -1128,7 +1130,7 @@ ngx_stream_variables_add_core_vars(ngx_conf_t *cf)
     {
         return NGX_ERROR;
     }
-
+    //添加变量
     for (cv = ngx_stream_core_variables; cv->name.len; cv++) {
         v = ngx_stream_add_variable(cf, &cv->name, cv->flags);
         if (v == NULL) {

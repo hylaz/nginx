@@ -1335,7 +1335,9 @@ ngx_close_idle_connections(ngx_cycle_t *cycle)
     }
 }
 
-
+/**
+ * 获取地址和端口
+ */ 
 ngx_int_t
 ngx_connection_local_sockaddr(ngx_connection_t *c, ngx_str_t *s,
     ngx_uint_t port)

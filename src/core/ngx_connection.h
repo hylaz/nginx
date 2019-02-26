@@ -196,6 +196,9 @@ struct ngx_connection_s {
 #endif
 };
 
+/**
+ * 设置连接的日志
+ */ 
 
 #define ngx_set_connection_log(c, l)                                         \
                                                                              \

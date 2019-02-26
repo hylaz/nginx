@@ -16,7 +16,9 @@ static void ngx_stream_close_connection(ngx_connection_t *c);
 static u_char *ngx_stream_log_error(ngx_log_t *log, u_char *buf, size_t len);
 static void ngx_stream_proxy_protocol_handler(ngx_event_t *rev);
 
-
+/**
+ * 初始化请求
+ */ 
 void
 ngx_stream_init_connection(ngx_connection_t *c)
 {
@@ -279,7 +281,9 @@ ngx_stream_proxy_protocol_handler(ngx_event_t *rev)
     ngx_stream_session_handler(rev);
 }
 
-
+/**
+ * session handler 
+ */ 
 void
 ngx_stream_session_handler(ngx_event_t *rev)
 {
@@ -292,7 +296,9 @@ ngx_stream_session_handler(ngx_event_t *rev)
     ngx_stream_core_run_phases(s);
 }
 
-
+/**
+ * 关闭stream seesion
+ */ 
 void
 ngx_stream_finalize_session(ngx_stream_session_t *s, ngx_uint_t rc)
 {
@@ -302,11 +308,13 @@ ngx_stream_finalize_session(ngx_stream_session_t *s, ngx_uint_t rc)
     s->status = rc;
 
     ngx_stream_log_session(s);
-
+    //关闭连接
     ngx_stream_close_connection(s->connection);
 }
 
-
+/**
+ * 记录日志
+ */ 
 static void
 ngx_stream_log_session(ngx_stream_session_t *s)
 {
@@ -324,7 +332,9 @@ ngx_stream_log_session(ngx_stream_session_t *s)
     }
 }
 
-
+/**
+ * 关闭连接
+ */ 
 static void
 ngx_stream_close_connection(ngx_connection_t *c)
 {
@@ -343,7 +353,7 @@ ngx_stream_close_connection(ngx_connection_t *c)
     }
 
 #endif
-
+//添加统计数据
 #if (NGX_STAT_STUB)
     (void) ngx_atomic_fetch_add(ngx_stat_active, -1);
 #endif
@@ -355,7 +365,7 @@ ngx_stream_close_connection(ngx_connection_t *c)
     ngx_destroy_pool(pool);
 }
 
-
+//记录错误日志
 static u_char *
 ngx_stream_log_error(ngx_log_t *log, u_char *buf, size_t len)
 {

@@ -48,7 +48,9 @@ ngx_module_t  ngx_stream_write_filter_module = {
     NGX_MODULE_V1_PADDING
 };
 
-
+/**
+ * 过滤函数
+ */ 
 static ngx_int_t
 ngx_stream_write_filter(ngx_stream_session_t *s, ngx_chain_t *in,
     ngx_uint_t from_upstream)
@@ -60,7 +62,7 @@ ngx_stream_write_filter(ngx_stream_session_t *s, ngx_chain_t *in,
     ngx_stream_write_filter_ctx_t  *ctx;
 
     ctx = ngx_stream_get_module_ctx(s, ngx_stream_write_filter_module);
-
+    //设置上下文
     if (ctx == NULL) {
         ctx = ngx_pcalloc(s->connection->pool,
                           sizeof(ngx_stream_write_filter_ctx_t));
@@ -263,7 +265,9 @@ ngx_stream_write_filter(ngx_stream_session_t *s, ngx_chain_t *in,
     return NGX_OK;
 }
 
-
+/**
+ * 过滤模块
+ */ 
 static ngx_int_t
 ngx_stream_write_filter_init(ngx_conf_t *cf)
 {

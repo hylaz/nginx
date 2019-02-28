@@ -114,7 +114,9 @@ ngx_module_t  ngx_stream_access_module = {
     NGX_MODULE_V1_PADDING
 };
 
-
+/**
+ * 模块处理函数
+ */ 
 static ngx_int_t
 ngx_stream_access_handler(ngx_stream_session_t *s)
 {
@@ -133,6 +135,7 @@ ngx_stream_access_handler(ngx_stream_session_t *s)
     case AF_INET:
         if (ascf->rules) {
             sin = (struct sockaddr_in *) s->connection->sockaddr;
+            //是否可以访问
             return ngx_stream_access_inet(s, ascf, sin->sin_addr.s_addr);
         }
         break;
@@ -148,9 +151,10 @@ ngx_stream_access_handler(ngx_stream_session_t *s)
             addr += p[13] << 16;
             addr += p[14] << 8;
             addr += p[15];
+
             return ngx_stream_access_inet(s, ascf, htonl(addr));
         }
-
+        //ipv6
         if (ascf->rules6) {
             return ngx_stream_access_inet6(s, ascf, p);
         }
@@ -162,6 +166,7 @@ ngx_stream_access_handler(ngx_stream_session_t *s)
 #if (NGX_HAVE_UNIX_DOMAIN)
 
     case AF_UNIX:
+        //unix通道
         if (ascf->rules_un) {
             return ngx_stream_access_unix(s, ascf);
         }
@@ -174,7 +179,9 @@ ngx_stream_access_handler(ngx_stream_session_t *s)
     return NGX_DECLINED;
 }
 
-
+/**
+ * 访问的ipv4限制
+ */ 
 static ngx_int_t
 ngx_stream_access_inet(ngx_stream_session_t *s,
     ngx_stream_access_srv_conf_t *ascf, in_addr_t addr)
@@ -199,7 +206,9 @@ ngx_stream_access_inet(ngx_stream_session_t *s,
 
 
 #if (NGX_HAVE_INET6)
-
+/**
+ * ipv6判断
+ */ 
 static ngx_int_t
 ngx_stream_access_inet6(ngx_stream_session_t *s,
     ngx_stream_access_srv_conf_t *ascf, u_char *p)
@@ -268,7 +277,9 @@ ngx_stream_access_unix(ngx_stream_session_t *s,
 
 #endif
 
-
+/**
+ * 符合要求
+ */ 
 static ngx_int_t
 ngx_stream_access_found(ngx_stream_session_t *s, ngx_uint_t deny)
 {
@@ -281,7 +292,9 @@ ngx_stream_access_found(ngx_stream_session_t *s, ngx_uint_t deny)
     return NGX_OK;
 }
 
-
+/**
+ * 解析 allow 
+ */ 
 static char *
 ngx_stream_access_rule(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -392,7 +405,9 @@ ngx_stream_access_rule(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * 创建ngx_stream_access_srv_conf_t结构体
+ */ 
 static void *
 ngx_stream_access_create_srv_conf(ngx_conf_t *cf)
 {
@@ -406,7 +421,9 @@ ngx_stream_access_create_srv_conf(ngx_conf_t *cf)
     return conf;
 }
 
-
+/**
+ * 合并结构体
+ */ 
 static char *
 ngx_stream_access_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -433,7 +450,9 @@ ngx_stream_access_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * access模块初始化
+ */ 
 static ngx_int_t
 ngx_stream_access_init(ngx_conf_t *cf)
 {

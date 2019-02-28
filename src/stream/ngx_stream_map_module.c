@@ -101,7 +101,9 @@ ngx_module_t  ngx_stream_map_module = {
     NGX_MODULE_V1_PADDING
 };
 
-
+/**
+ * 获取变量的值
+ */ 
 static ngx_int_t
 ngx_stream_map_variable(ngx_stream_session_t *s, ngx_stream_variable_value_t *v,
     uintptr_t data)
@@ -152,7 +154,9 @@ ngx_stream_map_variable(ngx_stream_session_t *s, ngx_stream_variable_value_t *v,
     return NGX_OK;
 }
 
-
+/**
+ * 创建ngx_stream_map_conf_t结构体
+ */ 
 static void *
 ngx_stream_map_create_conf(ngx_conf_t *cf)
 {
@@ -169,7 +173,9 @@ ngx_stream_map_create_conf(ngx_conf_t *cf)
     return mcf;
 }
 
-
+/**
+ * map配置项解析
+ */ 
 static char *
 ngx_stream_map_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -185,10 +191,11 @@ ngx_stream_map_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_stream_map_conf_ctx_t            ctx;
     ngx_stream_compile_complex_value_t   ccv;
 
+    //hash size 设置
     if (mcf->hash_max_size == NGX_CONF_UNSET_UINT) {
         mcf->hash_max_size = 2048;
     }
-
+    
     if (mcf->hash_bucket_size == NGX_CONF_UNSET_UINT) {
         mcf->hash_bucket_size = ngx_cacheline_size;
 
@@ -201,7 +208,7 @@ ngx_stream_map_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     if (map == NULL) {
         return NGX_CONF_ERROR;
     }
-
+    //解析第一个参数
     value = cf->args->elts;
 
     ngx_memzero(&ccv, sizeof(ngx_stream_compile_complex_value_t));
@@ -213,7 +220,7 @@ ngx_stream_map_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     if (ngx_stream_compile_complex_value(&ccv) != NGX_OK) {
         return NGX_CONF_ERROR;
     }
-
+    //解析第二个参数
     name = value[2];
 
     if (name.data[0] != '$') {
@@ -224,7 +231,7 @@ ngx_stream_map_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     name.len--;
     name.data++;
-
+    //添加变量
     var = ngx_stream_add_variable(cf, &name, NGX_STREAM_VAR_CHANGEABLE);
     if (var == NULL) {
         return NGX_CONF_ERROR;
@@ -363,7 +370,9 @@ ngx_stream_map_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return rv;
 }
 
-
+/**
+ * dns比较大小
+ */ 
 static int ngx_libc_cdecl
 ngx_stream_map_cmp_dns_wildcards(const void *one, const void *two)
 {

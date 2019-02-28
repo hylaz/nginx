@@ -230,7 +230,9 @@ ngx_stream_limit_conn_handler(ngx_stream_session_t *s)
     return NGX_DECLINED;
 }
 
-
+/**
+ * node节点插入红黑树temp中
+ */ 
 static void
 ngx_stream_limit_conn_rbtree_insert_value(ngx_rbtree_node_t *temp,
     ngx_rbtree_node_t *node, ngx_rbtree_node_t *sentinel)
@@ -271,7 +273,9 @@ ngx_stream_limit_conn_rbtree_insert_value(ngx_rbtree_node_t *temp,
     ngx_rbt_red(node);
 }
 
-
+/**
+ * 找到等于key的节点
+ */ 
 static ngx_rbtree_node_t *
 ngx_stream_limit_conn_lookup(ngx_rbtree_t *rbtree, ngx_str_t *key,
     uint32_t hash)
@@ -426,7 +430,9 @@ ngx_stream_limit_conn_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     return NGX_OK;
 }
 
-
+/**
+ * 创建ngx_stream_limit_conn_conf_t的配置文件
+ */ 
 static void *
 ngx_stream_limit_conn_create_conf(ngx_conf_t *cf)
 {
@@ -448,7 +454,9 @@ ngx_stream_limit_conn_create_conf(ngx_conf_t *cf)
     return conf;
 }
 
-
+/**
+ * 合并配置文件
+ */ 
 static char *
 ngx_stream_limit_conn_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -464,7 +472,9 @@ ngx_stream_limit_conn_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * limit_conn_zone 配置项
+ */ 
 static char *
 ngx_stream_limit_conn_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -626,7 +636,9 @@ ngx_stream_limit_conn(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * stream模块的处理函数
+ */ 
 static ngx_int_t
 ngx_stream_limit_conn_init(ngx_conf_t *cf)
 {

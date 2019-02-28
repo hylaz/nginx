@@ -247,7 +247,9 @@ ngx_hash_find_combined(ngx_hash_combined_t *hash, ngx_uint_t key, u_char *name,
 
 #define NGX_HASH_ELT_SIZE(name)                                               \
     (sizeof(void *) + ngx_align((name)->key.len + 2, sizeof(void *)))
-
+/**
+ * hash的初始化
+ */ 
 ngx_int_t
 ngx_hash_init(ngx_hash_init_t *hinit, ngx_hash_key_t *names, ngx_uint_t nelts)
 {
@@ -620,7 +622,9 @@ ngx_hash_key(u_char *data, size_t len)
     return key;
 }
 
-
+/**
+ * 忽略大小写的字符串离散函数
+ */ 
 ngx_uint_t
 ngx_hash_key_lc(u_char *data, size_t len)
 {
@@ -653,7 +657,9 @@ ngx_hash_strlow(u_char *dst, u_char *src, size_t n)
     return key;
 }
 
-
+/**
+ * 初始化keys数组
+ */ 
 ngx_int_t
 ngx_hash_keys_array_init(ngx_hash_keys_arrays_t *ha, ngx_uint_t type)
 {

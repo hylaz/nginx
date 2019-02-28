@@ -54,7 +54,9 @@ ngx_stream_script_flush_complex_value(ngx_stream_session_t *s,
     }
 }
 
-
+/**
+ * 获取变量的值
+ */ 
 ngx_int_t
 ngx_stream_complex_value(ngx_stream_session_t *s,
     ngx_stream_complex_value_t *val, ngx_str_t *value)

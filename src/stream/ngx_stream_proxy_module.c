@@ -346,7 +346,9 @@ ngx_module_t  ngx_stream_proxy_module = {
     NGX_MODULE_V1_PADDING
 };
 
-
+/**
+ * 代理处理函数
+ */ 
 static void
 ngx_stream_proxy_handler(ngx_stream_session_t *s)
 {
@@ -367,7 +369,7 @@ ngx_stream_proxy_handler(ngx_stream_session_t *s)
 
     ngx_log_debug0(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "proxy connection handler");
-
+    //申请上游upstream    
     u = ngx_pcalloc(c->pool, sizeof(ngx_stream_upstream_t));
     if (u == NULL) {
         ngx_stream_proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
@@ -375,7 +377,7 @@ ngx_stream_proxy_handler(ngx_stream_session_t *s)
     }
 
     s->upstream = u;
-
+    //设置日志处理handler
     s->log_handler = ngx_stream_proxy_log_error;
 
     u->requests = 1;
@@ -383,14 +385,16 @@ ngx_stream_proxy_handler(ngx_stream_session_t *s)
     u->peer.log = c->log;
     u->peer.log_error = NGX_ERROR_ERR;
 
+    //设置本地local
     if (ngx_stream_proxy_set_local(s, u, pscf->local) != NGX_OK) {
+        //代理错误
         ngx_stream_proxy_finalize(s, NGX_STREAM_INTERNAL_SERVER_ERROR);
         return;
     }
 
     u->peer.type = c->type;
     u->start_sec = ngx_time();
-
+    //设置事件处理函数
     c->write->handler = ngx_stream_proxy_downstream_handler;
     c->read->handler = ngx_stream_proxy_downstream_handler;
 
@@ -647,7 +651,9 @@ ngx_stream_proxy_set_local(ngx_stream_session_t *s, ngx_stream_upstream_t *u,
     return NGX_OK;
 }
 
-
+/**
+ * 连接上游服务 
+ */
 static void
 ngx_stream_proxy_connect(ngx_stream_session_t *s)
 {
@@ -719,14 +725,16 @@ ngx_stream_proxy_connect(ngx_stream_session_t *s)
         ngx_stream_proxy_init_upstream(s);
         return;
     }
-
+    //设置上游的读写事件
     pc->read->handler = ngx_stream_proxy_connect_handler;
     pc->write->handler = ngx_stream_proxy_connect_handler;
 
     ngx_add_timer(pc->write, pscf->connect_timeout);
 }
 
-
+/**
+ * 初始化上游upstream
+ */ 
 static void
 ngx_stream_proxy_init_upstream(ngx_stream_session_t *s)
 {
@@ -1197,7 +1205,9 @@ done:
 
 #endif
 
-
+/**
+ * 处理请求
+ */ 
 static void
 ngx_stream_proxy_downstream_handler(ngx_event_t *ev)
 {
@@ -1763,7 +1773,9 @@ ngx_stream_proxy_next_upstream(ngx_stream_session_t *s)
     ngx_stream_proxy_connect(s);
 }
 
-
+/**
+ * 结束请求
+ */
 static void
 ngx_stream_proxy_finalize(ngx_stream_session_t *s, ngx_uint_t rc)
 {
@@ -1829,7 +1841,9 @@ noupstream:
     ngx_stream_finalize_session(s, rc);
 }
 
-
+/**
+ * 错误日志
+ */ 
 static u_char *
 ngx_stream_proxy_log_error(ngx_log_t *log, u_char *buf, size_t len)
 {
@@ -1860,7 +1874,9 @@ ngx_stream_proxy_log_error(ngx_log_t *log, u_char *buf, size_t len)
     return p;
 }
 
-
+/**
+ * 创建ngx_stream_proxy_srv_conf_t结构体
+ */ 
 static void *
 ngx_stream_proxy_create_srv_conf(ngx_conf_t *cf)
 {
@@ -1911,7 +1927,9 @@ ngx_stream_proxy_create_srv_conf(ngx_conf_t *cf)
     return conf;
 }
 
-
+/**
+ * 合并ngx_stream_proxy_srv_conf_t配置任务
+ */ 
 static char *
 ngx_stream_proxy_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -2073,7 +2091,9 @@ ngx_stream_proxy_set_ssl(ngx_conf_t *cf, ngx_stream_proxy_srv_conf_t *pscf)
 
 #endif
 
-
+/**
+ * proxy_pass配置项
+ */ 
 static char *
 ngx_stream_proxy_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -2090,13 +2110,13 @@ ngx_stream_proxy_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     cscf = ngx_stream_conf_get_module_srv_conf(cf, ngx_stream_core_module);
-
+    //设置处理handler
     cscf->handler = ngx_stream_proxy_handler;
 
     value = cf->args->elts;
 
     url = &value[1];
-
+    //针对变量处理
     ngx_memzero(&ccv, sizeof(ngx_stream_compile_complex_value_t));
 
     ccv.cf = cf;
@@ -2132,7 +2152,9 @@ ngx_stream_proxy_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * proxy_bind配置项
+ */ 
 static char *
 ngx_stream_proxy_bind(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -2203,7 +2225,7 @@ ngx_stream_proxy_bind(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             return NGX_CONF_ERROR;
         }
     }
-
+    //transparent解析
     if (cf->args->nelts > 2) {
         if (ngx_strcmp(value[2].data, "transparent") == 0) {
 #if (NGX_HAVE_TRANSPARENT_PROXY)

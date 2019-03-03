@@ -531,7 +531,7 @@ extern ngx_uint_t ngx_http_max_module;
 
 extern ngx_str_t  ngx_http_core_get_method;
 
-
+//清除头部长度
 #define ngx_http_clear_content_length(r)                                      \
                                                                               \
     r->headers_out.content_length_n = -1;                                     \
@@ -539,7 +539,7 @@ extern ngx_str_t  ngx_http_core_get_method;
         r->headers_out.content_length->hash = 0;                              \
         r->headers_out.content_length = NULL;                                 \
     }
-
+//清除接收内容为空
 #define ngx_http_clear_accept_ranges(r)                                       \
                                                                               \
     r->allow_ranges = 0;                                                      \
@@ -562,7 +562,9 @@ extern ngx_str_t  ngx_http_core_get_method;
         r->headers_out.location->hash = 0;                                    \
         r->headers_out.location = NULL;                                       \
     }
-
+/**
+ * 清除输出的etag
+ */ 
 #define ngx_http_clear_etag(r)                                                \
                                                                               \
     if (r->headers_out.etag) {                                                \

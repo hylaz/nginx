@@ -144,7 +144,9 @@ typedef struct {
 ngx_stream_upstream_srv_conf_t *ngx_stream_upstream_add(ngx_conf_t *cf,
     ngx_url_t *u, ngx_uint_t flags);
 
-
+/**
+ * 获取配置结构体
+ */ 
 #define ngx_stream_conf_upstream_srv_conf(uscf, module)                       \
     uscf->srv_conf[module.ctx_index]
 

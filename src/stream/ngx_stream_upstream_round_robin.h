@@ -121,7 +121,9 @@ struct ngx_stream_upstream_rr_peers_s {
 
 #endif
 
-
+/**
+ * 上下文数据
+ */ 
 typedef struct {
     ngx_uint_t                       config;
     ngx_stream_upstream_rr_peers_t  *peers;

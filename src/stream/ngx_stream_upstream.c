@@ -57,7 +57,9 @@ static ngx_stream_module_t  ngx_stream_upstream_module_ctx = {
     NULL                                   /* merge server configuration */
 };
 
-
+/**
+ * 模块结构体
+ */ 
 ngx_module_t  ngx_stream_upstream_module = {
     NGX_MODULE_V1,
     &ngx_stream_upstream_module_ctx,       /* module context */
@@ -103,7 +105,9 @@ static ngx_stream_variable_t  ngx_stream_upstream_vars[] = {
       ngx_stream_null_variable
 };
 
-
+/**
+ * 添加变量
+ */ 
 static ngx_int_t
 ngx_stream_upstream_add_variables(ngx_conf_t *cf)
 {
@@ -122,7 +126,9 @@ ngx_stream_upstream_add_variables(ngx_conf_t *cf)
     return NGX_OK;
 }
 
-
+/**
+ * upstream_addr变量
+ */ 
 static ngx_int_t
 ngx_stream_upstream_addr_variable(ngx_stream_session_t *s,
     ngx_stream_variable_value_t *v, uintptr_t data)
@@ -179,7 +185,9 @@ ngx_stream_upstream_addr_variable(ngx_stream_session_t *s,
     return NGX_OK;
 }
 
-
+/**
+ * upstream_bytes_sent 发送字节数
+ */ 
 static ngx_int_t
 ngx_stream_upstream_bytes_variable(ngx_stream_session_t *s,
     ngx_stream_variable_value_t *v, uintptr_t data)
@@ -232,7 +240,9 @@ ngx_stream_upstream_bytes_variable(ngx_stream_session_t *s,
     return NGX_OK;
 }
 
-
+/**
+ * upstream_connect_time 返回时间
+ */ 
 static ngx_int_t
 ngx_stream_upstream_response_time_variable(ngx_stream_session_t *s,
     ngx_stream_variable_value_t *v, uintptr_t data)
@@ -299,7 +309,9 @@ ngx_stream_upstream_response_time_variable(ngx_stream_session_t *s,
     return NGX_OK;
 }
 
-
+/**
+ * upstream 配置项
+ */ 
 static char *
 ngx_stream_upstream(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy)
 {
@@ -399,7 +411,9 @@ ngx_stream_upstream(ngx_conf_t *cf, ngx_command_t *cmd, void *dummy)
     return rv;
 }
 
-
+/**
+ * server配置项
+ */ 
 static char *
 ngx_stream_upstream_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -427,7 +441,7 @@ ngx_stream_upstream_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     fail_timeout = 10;
 
     for (i = 2; i < cf->args->nelts; i++) {
-
+        //权重
         if (ngx_strncmp(value[i].data, "weight=", 7) == 0) {
 
             if (!(uscf->flags & NGX_STREAM_UPSTREAM_WEIGHT)) {
@@ -442,7 +456,7 @@ ngx_stream_upstream_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
             continue;
         }
-
+        //最大连接数
         if (ngx_strncmp(value[i].data, "max_conns=", 10) == 0) {
 
             if (!(uscf->flags & NGX_STREAM_UPSTREAM_MAX_CONNS)) {
@@ -457,7 +471,7 @@ ngx_stream_upstream_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
             continue;
         }
-
+        //最大失败次数
         if (ngx_strncmp(value[i].data, "max_fails=", 10) == 0) {
 
             if (!(uscf->flags & NGX_STREAM_UPSTREAM_MAX_FAILS)) {
@@ -472,7 +486,7 @@ ngx_stream_upstream_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
             continue;
         }
-
+        //失败时间
         if (ngx_strncmp(value[i].data, "fail_timeout=", 13) == 0) {
 
             if (!(uscf->flags & NGX_STREAM_UPSTREAM_FAIL_TIMEOUT)) {
@@ -490,7 +504,7 @@ ngx_stream_upstream_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
             continue;
         }
-
+        //备用服务器
         if (ngx_strcmp(value[i].data, "backup") == 0) {
 
             if (!(uscf->flags & NGX_STREAM_UPSTREAM_BACKUP)) {
@@ -501,7 +515,7 @@ ngx_stream_upstream_server(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
             continue;
         }
-
+        //标记失败
         if (ngx_strcmp(value[i].data, "down") == 0) {
 
             if (!(uscf->flags & NGX_STREAM_UPSTREAM_DOWN)) {
@@ -561,7 +575,9 @@ not_supported:
     return NGX_CONF_ERROR;
 }
 
-
+/**
+ * 添加服务器
+ */ 
 ngx_stream_upstream_srv_conf_t *
 ngx_stream_upstream_add(ngx_conf_t *cf, ngx_url_t *u, ngx_uint_t flags)
 {
@@ -669,7 +685,9 @@ ngx_stream_upstream_add(ngx_conf_t *cf, ngx_url_t *u, ngx_uint_t flags)
     return uscf;
 }
 
-
+/**
+ * 创建ngx_stream_upstream_main_conf_t结构体
+ */ 
 static void *
 ngx_stream_upstream_create_main_conf(ngx_conf_t *cf)
 {
@@ -690,7 +708,9 @@ ngx_stream_upstream_create_main_conf(ngx_conf_t *cf)
     return umcf;
 }
 
-
+/**
+ * 初始化结构体
+ */ 
 static char *
 ngx_stream_upstream_init_main_conf(ngx_conf_t *cf, void *conf)
 {

@@ -189,7 +189,9 @@ ngx_http_append_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * 模块入口文件
+ */ 
 static ngx_int_t
 ngx_http_append_init(ngx_conf_t *cf)
 {

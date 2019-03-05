@@ -499,7 +499,9 @@ static ngx_http_variable_t  ngx_http_grpc_vars[] = {
       ngx_http_null_variable
 };
 
-
+/**
+ * grpc处理的函数
+ */ 
 static ngx_int_t
 ngx_http_grpc_handler(ngx_http_request_t *r)
 {
@@ -507,7 +509,7 @@ ngx_http_grpc_handler(ngx_http_request_t *r)
     ngx_http_upstream_t       *u;
     ngx_http_grpc_ctx_t       *ctx;
     ngx_http_grpc_loc_conf_t  *glcf;
-
+    /**创建upstream**/
     if (ngx_http_upstream_create(r) != NGX_OK) {
         return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
@@ -532,7 +534,13 @@ ngx_http_grpc_handler(ngx_http_request_t *r)
     u->output.tag = (ngx_buf_tag_t) &ngx_http_grpc_module;
 
     u->conf = &glcf->upstream;
-
+    /**
+     * create_request
+     * reinit_request
+     * process_request
+     * abort_request
+     * finalize_request 
+     */ 
     u->create_request = ngx_http_grpc_create_request;
     u->reinit_request = ngx_http_grpc_reinit_request;
     u->process_header = ngx_http_grpc_process_header;
@@ -563,7 +571,9 @@ ngx_http_grpc_handler(ngx_http_request_t *r)
     return NGX_DONE;
 }
 
-
+/**
+ * 创建request
+ */ 
 static ngx_int_t
 ngx_http_grpc_create_request(ngx_http_request_t *r)
 {
@@ -1057,7 +1067,9 @@ ngx_http_grpc_create_request(ngx_http_request_t *r)
     return NGX_OK;
 }
 
-
+/**
+ * 重新初始化request
+ */ 
 static ngx_int_t
 ngx_http_grpc_reinit_request(ngx_http_request_t *r)
 {
@@ -1410,7 +1422,9 @@ ngx_http_grpc_body_output_filter(void *data, ngx_chain_t *in)
     return rc;
 }
 
-
+/**
+ * 处理请求头部
+ */ 
 static ngx_int_t
 ngx_http_grpc_process_header(ngx_http_request_t *r)
 {
@@ -2349,7 +2363,9 @@ ngx_http_grpc_parse_frame(ngx_http_request_t *r, ngx_http_grpc_ctx_t *ctx,
     return NGX_AGAIN;
 }
 
-
+/**
+ * 分析头部信息
+ */ 
 static ngx_int_t
 ngx_http_grpc_parse_header(ngx_http_request_t *r, ngx_http_grpc_ctx_t *ctx,
     ngx_buf_t *b)
@@ -2568,7 +2584,9 @@ ngx_http_grpc_parse_header(ngx_http_request_t *r, ngx_http_grpc_ctx_t *ctx,
     return NGX_ERROR;
 }
 
-
+/**
+ * 分析fragment
+ */ 
 static ngx_int_t
 ngx_http_grpc_parse_fragment(ngx_http_request_t *r, ngx_http_grpc_ctx_t *ctx,
     ngx_buf_t *b)
@@ -3125,7 +3143,9 @@ ngx_http_grpc_parse_fragment(ngx_http_request_t *r, ngx_http_grpc_ctx_t *ctx,
     return NGX_DONE;
 }
 
-
+/**
+ * 验证header name 正确性
+ */ 
 static ngx_int_t
 ngx_http_grpc_validate_header_name(ngx_http_request_t *r, ngx_str_t *s)
 {
@@ -3151,7 +3171,9 @@ ngx_http_grpc_validate_header_name(ngx_http_request_t *r, ngx_str_t *s)
     return NGX_OK;
 }
 
-
+/**
+ * 验证header value
+ */ 
 static ngx_int_t
 ngx_http_grpc_validate_header_value(ngx_http_request_t *r, ngx_str_t *s)
 {
@@ -4000,7 +4022,9 @@ ngx_http_grpc_cleanup(void *data)
     return;
 }
 
-
+/**
+ * 请求错误
+ */ 
 static void
 ngx_http_grpc_abort_request(ngx_http_request_t *r)
 {
@@ -4009,7 +4033,9 @@ ngx_http_grpc_abort_request(ngx_http_request_t *r)
     return;
 }
 
-
+/**
+ * 结束请求
+ */ 
 static void
 ngx_http_grpc_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
 {
@@ -4018,7 +4044,9 @@ ngx_http_grpc_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
     return;
 }
 
-
+/**
+ * grpc_internal_trailers变量获取方法
+ */ 
 static ngx_int_t
 ngx_http_grpc_internal_trailers_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
@@ -4050,7 +4078,9 @@ ngx_http_grpc_internal_trailers_variable(ngx_http_request_t *r,
     return NGX_OK;
 }
 
-
+/**
+ * 添加grpc变量
+ */ 
 static ngx_int_t
 ngx_http_grpc_add_variables(ngx_conf_t *cf)
 {
@@ -4069,7 +4099,9 @@ ngx_http_grpc_add_variables(ngx_conf_t *cf)
     return NGX_OK;
 }
 
-
+/**
+ * ngx_http_grpc_loc_conf_t 配置结构体
+ */ 
 static void *
 ngx_http_grpc_create_loc_conf(ngx_conf_t *cf)
 {
@@ -4145,7 +4177,9 @@ ngx_http_grpc_create_loc_conf(ngx_conf_t *cf)
     return conf;
 }
 
-
+/**
+ * 合并配置项
+ */ 
 static char *
 ngx_http_grpc_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -4256,6 +4290,9 @@ ngx_http_grpc_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     }
 
     if (clcf->lmt_excpt && clcf->handler == NULL && conf->upstream.upstream) {
+        /**
+         * 设置handler
+         */ 
         clcf->handler = ngx_http_grpc_handler;
     }
 
@@ -4286,7 +4323,9 @@ ngx_http_grpc_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * 初始化headers
+ */ 
 static ngx_int_t
 ngx_http_grpc_init_headers(ngx_conf_t *cf, ngx_http_grpc_loc_conf_t *conf,
     ngx_http_grpc_headers_t *headers, ngx_keyval_t *default_headers)
@@ -4459,7 +4498,9 @@ ngx_http_grpc_init_headers(ngx_conf_t *cf, ngx_http_grpc_loc_conf_t *conf,
     return ngx_hash_init(&hash, headers_names.elts, headers_names.nelts);
 }
 
-
+/**
+ * grpc_pass 配置项
+ */ 
 static char *
 ngx_http_grpc_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -4522,7 +4563,7 @@ ngx_http_grpc_pass(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
-
+    /**设置handler函数*/
     clcf->handler = ngx_http_grpc_handler;
 
     if (clcf->name.len && clcf->name.data[clcf->name.len - 1] == '/') {

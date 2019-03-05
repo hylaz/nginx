@@ -58,7 +58,9 @@ ngx_module_t  ngx_stream_upstream_least_conn_module = {
     NGX_MODULE_V1_PADDING
 };
 
-
+/**
+ * 最少连接的回调函数
+ */ 
 static ngx_int_t
 ngx_stream_upstream_init_least_conn(ngx_conf_t *cf,
     ngx_stream_upstream_srv_conf_t *us)
@@ -69,7 +71,7 @@ ngx_stream_upstream_init_least_conn(ngx_conf_t *cf,
     if (ngx_stream_upstream_init_round_robin(cf, us) != NGX_OK) {
         return NGX_ERROR;
     }
-
+    /* 设置peer初始化*/
     us->peer.init = ngx_stream_upstream_init_least_conn_peer;
 
     return NGX_OK;
@@ -283,7 +285,9 @@ failed:
     return NGX_BUSY;
 }
 
-
+/**
+ * least_conn 配置项
+ */ 
 static char *
 ngx_stream_upstream_least_conn(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -295,7 +299,7 @@ ngx_stream_upstream_least_conn(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         ngx_conf_log_error(NGX_LOG_WARN, cf, 0,
                            "load balancing method redefined");
     }
-
+    //设置初始化upstream的回调函数
     uscf->peer.init_upstream = ngx_stream_upstream_init_least_conn;
 
     uscf->flags = NGX_STREAM_UPSTREAM_CREATE

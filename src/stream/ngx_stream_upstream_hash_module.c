@@ -103,7 +103,9 @@ ngx_module_t  ngx_stream_upstream_hash_module = {
     NGX_MODULE_V1_PADDING
 };
 
-
+/**
+ * 初始化init_upstream函数
+ */ 
 static ngx_int_t
 ngx_stream_upstream_init_hash(ngx_conf_t *cf,
     ngx_stream_upstream_srv_conf_t *us)
@@ -117,7 +119,9 @@ ngx_stream_upstream_init_hash(ngx_conf_t *cf,
     return NGX_OK;
 }
 
-
+/**
+ * init阶段
+ */ 
 static ngx_int_t
 ngx_stream_upstream_init_hash_peer(ngx_stream_session_t *s,
     ngx_stream_upstream_srv_conf_t *us)
@@ -136,12 +140,15 @@ ngx_stream_upstream_init_hash_peer(ngx_stream_session_t *s,
     if (ngx_stream_upstream_init_round_robin_peer(s, us) != NGX_OK) {
         return NGX_ERROR;
     }
-
+    /**设置get函数**/
     s->upstream->peer.get = ngx_stream_upstream_get_hash_peer;
 
     hcf = ngx_stream_conf_upstream_srv_conf(us,
                                             ngx_stream_upstream_hash_module);
 
+    /**
+     * 获取hp->key的值
+     */ 
     if (ngx_stream_complex_value(s, &hcf->key, &hp->key) != NGX_OK) {
         return NGX_ERROR;
     }
@@ -158,7 +165,9 @@ ngx_stream_upstream_init_hash_peer(ngx_stream_session_t *s,
     return NGX_OK;
 }
 
-
+/**
+ * 
+ */ 
 static ngx_int_t
 ngx_stream_upstream_get_hash_peer(ngx_peer_connection_t *pc, void *data)
 {
@@ -280,7 +289,9 @@ ngx_stream_upstream_get_hash_peer(ngx_peer_connection_t *pc, void *data)
     return NGX_OK;
 }
 
-
+/**
+ * 一致性hash初始化
+ */ 
 static ngx_int_t
 ngx_stream_upstream_init_chash(ngx_conf_t *cf,
     ngx_stream_upstream_srv_conf_t *us)
@@ -408,7 +419,9 @@ ngx_stream_upstream_init_chash(ngx_conf_t *cf,
     return NGX_OK;
 }
 
-
+/**
+ * 比较函数
+ */ 
 static int ngx_libc_cdecl
 ngx_stream_upstream_chash_cmp_points(const void *one, const void *two)
 {
@@ -617,7 +630,9 @@ ngx_stream_upstream_get_chash_peer(ngx_peer_connection_t *pc, void *data)
     return NGX_OK;
 }
 
-
+/**
+ * 创建ngx_stream_upstream_hash_srv_conf_t结构体
+ */ 
 static void *
 ngx_stream_upstream_hash_create_conf(ngx_conf_t *cf)
 {
@@ -633,7 +648,9 @@ ngx_stream_upstream_hash_create_conf(ngx_conf_t *cf)
     return conf;
 }
 
-
+/**
+ * hash配置项
+ */ 
 static char *
 ngx_stream_upstream_hash(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -668,10 +685,10 @@ ngx_stream_upstream_hash(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
                   |NGX_STREAM_UPSTREAM_MAX_FAILS
                   |NGX_STREAM_UPSTREAM_FAIL_TIMEOUT
                   |NGX_STREAM_UPSTREAM_DOWN;
-
+    /**设置init_upstream函数 **/
     if (cf->args->nelts == 2) {
         uscf->peer.init_upstream = ngx_stream_upstream_init_hash;
-
+    /**一致性hash的init_upstream函数**/
     } else if (ngx_strcmp(value[2].data, "consistent") == 0) {
         uscf->peer.init_upstream = ngx_stream_upstream_init_chash;
 

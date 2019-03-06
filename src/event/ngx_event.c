@@ -9,7 +9,7 @@
 #include <ngx_core.h>
 #include <ngx_event.h>
 
-
+/**默认最大连接数*/
 #define DEFAULT_CONNECTIONS  512
 
 
@@ -77,7 +77,9 @@ ngx_atomic_t         *ngx_stat_waiting = &ngx_stat_waiting0;
 #endif
 
 
-
+/***
+ * 事件核心模块
+ */ 
 static ngx_command_t  ngx_events_commands[] = {
 
     { ngx_string("events"),
@@ -90,14 +92,18 @@ static ngx_command_t  ngx_events_commands[] = {
       ngx_null_command
 };
 
-
+/**
+ * 事件模块的上下文数据
+ */ 
 static ngx_core_module_t  ngx_events_module_ctx = {
     ngx_string("events"),
     NULL,
     ngx_event_init_conf
 };
 
-
+/**
+ * event模块
+ */ 
 ngx_module_t  ngx_events_module = {
     NGX_MODULE_V1,
     &ngx_events_module_ctx,                /* module context */
@@ -238,24 +244,24 @@ ngx_process_events_and_timers(ngx_cycle_t *cycle)
     }
 
     delta = ngx_current_msec;
-
+    //处理事件
     (void) ngx_process_events(cycle, timer, flags);
 
     delta = ngx_current_msec - delta;
 
     ngx_log_debug1(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
                    "timer delta: %M", delta);
-
+    //处理接收连接的队列
     ngx_event_process_posted(cycle, &ngx_posted_accept_events);
 
     if (ngx_accept_mutex_held) {
         ngx_shmtx_unlock(&ngx_accept_mutex);
     }
-
+    //时间事件
     if (delta) {
         ngx_event_expire_timers();
     }
-
+    //连接事件
     ngx_event_process_posted(cycle, &ngx_posted_events);
 }
 
@@ -406,7 +412,9 @@ ngx_handle_write_event(ngx_event_t *wev, size_t lowat)
     return NGX_OK;
 }
 
-
+/**
+ * 模块初始化
+ */ 
 static char *
 ngx_event_init_conf(ngx_cycle_t *cycle, void *conf)
 {
@@ -420,7 +428,7 @@ ngx_event_init_conf(ngx_cycle_t *cycle, void *conf)
                       "no \"events\" section in configuration");
         return NGX_CONF_ERROR;
     }
-
+    /**连接数大于listenning数量**/
     if (cycle->connection_n < cycle->listening.nelts + 1) {
 
         /*
@@ -459,7 +467,9 @@ ngx_event_init_conf(ngx_cycle_t *cycle, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * 模块初始化
+ */ 
 static ngx_int_t
 ngx_event_module_init(ngx_cycle_t *cycle)
 {
@@ -590,7 +600,7 @@ ngx_event_module_init(ngx_cycle_t *cycle)
 
 
 #if !(NGX_WIN32)
-
+//时间处理函数
 static void
 ngx_timer_signal_handler(int signo)
 {
@@ -603,7 +613,9 @@ ngx_timer_signal_handler(int signo)
 
 #endif
 
-
+/**
+ * 进程初始化
+ */ 
 static ngx_int_t
 ngx_event_process_init(ngx_cycle_t *cycle)
 {
@@ -640,7 +652,7 @@ ngx_event_process_init(ngx_cycle_t *cycle)
 
     ngx_queue_init(&ngx_posted_accept_events);
     ngx_queue_init(&ngx_posted_events);
-
+    //初始化时间模块
     if (ngx_event_timer_init(cycle->log) == NGX_ERROR) {
         return NGX_ERROR;
     }
@@ -719,7 +731,7 @@ ngx_event_process_init(ngx_cycle_t *cycle)
     }
 
 #endif
-
+    //初始化connection read_event write_event
     cycle->connections =
         ngx_alloc(sizeof(ngx_connection_t) * cycle->connection_n, cycle->log);
     if (cycle->connections == NULL) {
@@ -939,7 +951,9 @@ ngx_send_lowat(ngx_connection_t *c, size_t lowat)
     return NGX_OK;
 }
 
-
+/**
+ * 配置项解析
+ */ 
 static char *
 ngx_events_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -954,7 +968,7 @@ ngx_events_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     }
 
     /* count the number of the event modules and set up their indices */
-
+    
     ngx_event_max_module = ngx_count_modules(cf->cycle, NGX_EVENT_MODULE);
 
     ctx = ngx_pcalloc(cf->pool, sizeof(void *));
@@ -997,7 +1011,9 @@ ngx_events_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     if (rv != NGX_CONF_OK) {
         return rv;
     }
-
+    /**
+     * 初始化
+     */ 
     for (i = 0; cf->cycle->modules[i]; i++) {
         if (cf->cycle->modules[i]->type != NGX_EVENT_MODULE) {
             continue;
@@ -1017,7 +1033,9 @@ ngx_events_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * worker_connections配置项
+ */ 
 static char *
 ngx_event_connections(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -1043,7 +1061,9 @@ ngx_event_connections(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * use配置项
+ */ 
 static char *
 ngx_event_use(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -1106,7 +1126,9 @@ ngx_event_use(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_ERROR;
 }
 
-
+/**
+ * debug_connection配置项
+ */ 
 static char *
 ngx_event_debug_connection(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -1210,7 +1232,9 @@ ngx_event_debug_connection(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * 创建配置结构体
+ */ 
 static void *
 ngx_event_core_create_conf(ngx_cycle_t *cycle)
 {
@@ -1241,7 +1265,9 @@ ngx_event_core_create_conf(ngx_cycle_t *cycle)
     return ecf;
 }
 
-
+/**
+ * 初始化ngx_event_conf_t结构体
+ */ 
 static char *
 ngx_event_core_init_conf(ngx_cycle_t *cycle, void *conf)
 {

@@ -153,7 +153,9 @@ ngx_conf_add_dump(ngx_conf_t *cf, ngx_str_t *filename)
     return NGX_OK;
 }
 
-
+/**
+ * 解析模块
+ */ 
 char *
 ngx_conf_parse(ngx_conf_t *cf, ngx_str_t *filename)
 {
@@ -240,6 +242,7 @@ ngx_conf_parse(ngx_conf_t *cf, ngx_str_t *filename)
 
 
     for ( ;; ) {
+        //读取文件
         rc = ngx_conf_read_token(cf);
 
         /*
@@ -255,7 +258,7 @@ ngx_conf_parse(ngx_conf_t *cf, ngx_str_t *filename)
         if (rc == NGX_ERROR) {
             goto done;
         }
-
+        //读取结束
         if (rc == NGX_CONF_BLOCK_DONE) {
 
             if (type != parse_block) {
@@ -265,7 +268,7 @@ ngx_conf_parse(ngx_conf_t *cf, ngx_str_t *filename)
 
             goto done;
         }
-
+        //文件读取完成
         if (rc == NGX_CONF_FILE_DONE) {
 
             if (type == parse_block) {
@@ -276,7 +279,7 @@ ngx_conf_parse(ngx_conf_t *cf, ngx_str_t *filename)
 
             goto done;
         }
-
+        //开始读取
         if (rc == NGX_CONF_BLOCK_START) {
 
             if (type == parse_param) {
@@ -322,11 +325,11 @@ ngx_conf_parse(ngx_conf_t *cf, ngx_str_t *filename)
             goto failed;
         }
     }
-
+//读取失败
 failed:
 
     rc = NGX_ERROR;
-
+//读取完成
 done:
 
     if (filename) {
@@ -351,7 +354,9 @@ done:
     return NGX_CONF_OK;
 }
 
-
+/**
+ * 解析配置文件项
+ */ 
 static ngx_int_t
 ngx_conf_handler(ngx_conf_t *cf, ngx_int_t last)
 {
@@ -498,7 +503,9 @@ invalid:
     return NGX_ERROR;
 }
 
-
+/**
+ * 读取配置文件
+ */ 
 static ngx_int_t
 ngx_conf_read_token(ngx_conf_t *cf)
 {

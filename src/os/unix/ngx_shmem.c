@@ -83,7 +83,9 @@ ngx_shm_free(ngx_shm_t *shm)
 #include <sys/ipc.h>
 #include <sys/shm.h>
 
-
+/**
+ * 申请shm
+ */ 
 ngx_int_t
 ngx_shm_alloc(ngx_shm_t *shm)
 {

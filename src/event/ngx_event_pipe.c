@@ -56,7 +56,7 @@ ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
 
         do_write = 1;
     }
-
+    //读取上游
     if (p->upstream->fd != (ngx_socket_t) -1) {
         rev = p->upstream->read;
 
@@ -75,7 +75,7 @@ ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
             }
         }
     }
-
+    //写到下游
     if (p->downstream->fd != (ngx_socket_t) -1
         && p->downstream->data == p->output_ctx)
     {
@@ -97,7 +97,9 @@ ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write)
     return NGX_OK;
 }
 
-
+/**
+ * 读取上游事件
+ */ 
 static ngx_int_t
 ngx_event_pipe_read_upstream(ngx_event_pipe_t *p)
 {

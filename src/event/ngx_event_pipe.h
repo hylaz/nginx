@@ -98,7 +98,7 @@ struct ngx_event_pipe_s {
     /* STUB */ int     num;
 };
 
-
+/**函数**/
 ngx_int_t ngx_event_pipe(ngx_event_pipe_t *p, ngx_int_t do_write);
 ngx_int_t ngx_event_pipe_copy_input_filter(ngx_event_pipe_t *p, ngx_buf_t *buf);
 ngx_int_t ngx_event_pipe_add_free_buf(ngx_event_pipe_t *p, ngx_buf_t *b);

@@ -90,3 +90,31 @@
 	path = plugins/nginmesh
 	ignore=all
 	url = https://github.com/nginxinc/nginmesh.git
+[submodule "module/nginx-push-stream-module"]
+	path = module/nginx-push-stream-module
+	ignore=all
+	url = https://github.com/wandenberg/nginx-push-stream-module.git
+[submodule "module/nginx-hmux-module"]
+	path = module/nginx-hmux-module
+	ignore=all
+	url = https://github.com/wangbin579/nginx-hmux-module.git
+[submodule "lua/lua-resty-http"]
+	path = lua/lua-resty-http
+	ignore=all
+	url = https://github.com/pintsized/lua-resty-http.git
+[submodule "lua/lua-resty-checkups"]
+	path = lua/lua-resty-checkups
+	ignore=all
+	url = https://github.com/upyun/lua-resty-checkups.git
+[submodule "module/ngx-http-auth-jwt-module"]
+	path = module/ngx-http-auth-jwt-module
+	ignore=all 
+	url = https://github.com/TeslaGov/ngx-http-auth-jwt-module.git
+[submodule "module/nginx-module-vts"]
+	path = module/nginx-module-vts
+	ignore=all
+	url = https://github.com/vozlt/nginx-module-vts.git
+[submodule "module/nginx-module-stream-sts"]
+	path = module/nginx-module-stream-sts
+	ignore=all
+	url = https://github.com/vozlt/nginx-module-stream-sts.git

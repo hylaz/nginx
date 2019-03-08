@@ -10,7 +10,9 @@
 #include <ngx_event.h>
 #include <ngx_channel.h>
 
-
+/**
+ * 信号处理方面
+ */ 
 typedef struct {
     int     signo;
     char   *signame;
@@ -82,7 +84,9 @@ ngx_signal_t  signals[] = {
     { 0, NULL, "", NULL }
 };
 
-
+/**
+ * 生成子进程
+ */ 
 ngx_pid_t
 ngx_spawn_process(ngx_cycle_t *cycle, ngx_spawn_proc_pt proc, void *data,
     char *name, ngx_int_t respawn)
@@ -280,7 +284,9 @@ ngx_execute_proc(ngx_cycle_t *cycle, void *data)
     exit(1);
 }
 
-
+/**
+ * 初始化信号处理
+ */ 
 ngx_int_t
 ngx_init_signals(ngx_log_t *log)
 {
@@ -314,7 +320,9 @@ ngx_init_signals(ngx_log_t *log)
     return NGX_OK;
 }
 
-
+/**
+ * 信号处理函数
+ */ 
 static void
 ngx_signal_handler(int signo, siginfo_t *siginfo, void *ucontext)
 {
@@ -466,7 +474,9 @@ ngx_signal_handler(int signo, siginfo_t *siginfo, void *ucontext)
     ngx_set_errno(err);
 }
 
-
+/**
+ * 进程状态
+ */ 
 static void
 ngx_process_get_status(void)
 {
@@ -607,7 +617,9 @@ ngx_unlock_mutexes(ngx_pid_t pid)
     }
 }
 
-
+/**
+ * 打开debug
+ */ 
 void
 ngx_debug_point(void)
 {
@@ -627,7 +639,9 @@ ngx_debug_point(void)
     }
 }
 
-
+/**
+ * 进程处理
+ */ 
 ngx_int_t
 ngx_os_signal_process(ngx_cycle_t *cycle, char *name, ngx_pid_t pid)
 {

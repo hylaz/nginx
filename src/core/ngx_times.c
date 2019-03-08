@@ -76,7 +76,9 @@ ngx_time_init(void)
     ngx_time_update();
 }
 
-
+/**
+ * 更新时间
+ */ 
 void
 ngx_time_update(void)
 {
@@ -218,7 +220,9 @@ ngx_monotonic_time(time_t sec, ngx_uint_t msec)
 
 
 #if !(NGX_WIN32)
-
+/**
+ * 信号更新时间
+ */ 
 void
 ngx_time_sigsafe_update(void)
 {

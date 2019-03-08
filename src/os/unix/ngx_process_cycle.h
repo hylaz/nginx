@@ -33,8 +33,13 @@ typedef struct {
     ngx_msec_t                 delay;
 } ngx_cache_manager_ctx_t;
 
-
+/**
+ * 多进程模式
+ */ 
 void ngx_master_process_cycle(ngx_cycle_t *cycle);
+/**
+ * 单进程模式
+ */ 
 void ngx_single_process_cycle(ngx_cycle_t *cycle);
 
 

@@ -30,7 +30,9 @@ static void ngx_cache_loader_process_handler(ngx_event_t *ev);
 
 ngx_uint_t    ngx_process;
 ngx_uint_t    ngx_worker;
-ngx_pid_t     ngx_pid;
+/**进程id**/
+ngx_pid_t     ngx_pid; 
+/**父级进程id**/
 ngx_pid_t     ngx_parent;
 
 sig_atomic_t  ngx_reap;
@@ -52,7 +54,7 @@ sig_atomic_t  ngx_noaccept;
 ngx_uint_t    ngx_noaccepting;
 ngx_uint_t    ngx_restart;
 
-
+/**主进程id**/
 static u_char  master_process[] = "master process";
 
 
@@ -69,7 +71,7 @@ static ngx_cycle_t      ngx_exit_cycle;
 static ngx_log_t        ngx_exit_log;
 static ngx_open_file_t  ngx_exit_log_file;
 
-
+/**主进程循环**/
 void
 ngx_master_process_cycle(ngx_cycle_t *cycle)
 {
@@ -162,7 +164,7 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
         ngx_log_debug0(NGX_LOG_DEBUG_EVENT, cycle->log, 0, "sigsuspend");
 
         sigsuspend(&set);
-
+        /**更新时间**/
         ngx_time_update();
 
         ngx_log_debug1(NGX_LOG_DEBUG_EVENT, cycle->log, 0,
@@ -284,7 +286,9 @@ ngx_master_process_cycle(ngx_cycle_t *cycle)
     }
 }
 
-
+/**
+ * 单进程启动
+ */ 
 void
 ngx_single_process_cycle(ngx_cycle_t *cycle)
 {
@@ -341,7 +345,9 @@ ngx_single_process_cycle(ngx_cycle_t *cycle)
     }
 }
 
-
+/**
+ * 开启worker进程
+ */ 
 static void
 ngx_start_worker_processes(ngx_cycle_t *cycle, ngx_int_t n, ngx_int_t type)
 {
@@ -367,7 +373,9 @@ ngx_start_worker_processes(ngx_cycle_t *cycle, ngx_int_t n, ngx_int_t type)
     }
 }
 
-
+/**
+ * 开启缓存进程管理器
+ */ 
 static void
 ngx_start_cache_manager_processes(ngx_cycle_t *cycle, ngx_uint_t respawn)
 {
@@ -451,7 +459,9 @@ ngx_pass_open_channel(ngx_cycle_t *cycle, ngx_channel_t *ch)
     }
 }
 
-
+/**
+ * work进程处理
+ */ 
 static void
 ngx_signal_worker_processes(ngx_cycle_t *cycle, int signo)
 {
@@ -680,7 +690,9 @@ ngx_reap_children(ngx_cycle_t *cycle)
     return live;
 }
 
-
+/**
+ * 主进程退出
+ */ 
 static void
 ngx_master_process_exit(ngx_cycle_t *cycle)
 {
@@ -776,7 +788,9 @@ ngx_worker_process_cycle(ngx_cycle_t *cycle, void *data)
     }
 }
 
-
+/**
+ * worker进程初始化
+ */ 
 static void
 ngx_worker_process_init(ngx_cycle_t *cycle, ngx_int_t worker)
 {
@@ -973,7 +987,9 @@ ngx_worker_process_init(ngx_cycle_t *cycle, ngx_int_t worker)
     }
 }
 
-
+/**
+ * worker进程退出
+ */ 
 static void
 ngx_worker_process_exit(ngx_cycle_t *cycle)
 {
@@ -1034,7 +1050,9 @@ ngx_worker_process_exit(ngx_cycle_t *cycle)
     exit(0);
 }
 
-
+/**
+ * 通道处理
+ */ 
 static void
 ngx_channel_handler(ngx_event_t *ev)
 {
@@ -1122,7 +1140,9 @@ ngx_channel_handler(ngx_event_t *ev)
     }
 }
 
-
+/**
+ * 缓存进程处理
+ */ 
 static void
 ngx_cache_manager_process_cycle(ngx_cycle_t *cycle, void *data)
 {
@@ -1173,7 +1193,9 @@ ngx_cache_manager_process_cycle(ngx_cycle_t *cycle, void *data)
     }
 }
 
-
+/**
+ * cache进程处理
+ */ 
 static void
 ngx_cache_manager_process_handler(ngx_event_t *ev)
 {

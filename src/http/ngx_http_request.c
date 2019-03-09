@@ -928,7 +928,9 @@ ngx_http_ssl_servername(ngx_ssl_conn_t *ssl_conn, int *ad, void *arg)
 
 #endif
 
-
+/**
+ * 处理请求首行
+ */ 
 static void
 ngx_http_process_request_line(ngx_event_t *rev)
 {
@@ -943,7 +945,9 @@ ngx_http_process_request_line(ngx_event_t *rev)
 
     ngx_log_debug0(NGX_LOG_DEBUG_HTTP, rev->log, 0,
                    "http process request line");
-
+    /**
+     * 客户端超时
+     */ 
     if (rev->timedout) {
         ngx_log_error(NGX_LOG_INFO, c->log, NGX_ETIMEDOUT, "client timed out");
         c->timedout = 1;
@@ -1206,7 +1210,9 @@ ngx_http_process_request_uri(ngx_http_request_t *r)
     return NGX_OK;
 }
 
-
+/**
+ * 处理请求头部
+ */ 
 static void
 ngx_http_process_request_headers(ngx_event_t *rev)
 {

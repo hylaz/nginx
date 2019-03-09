@@ -285,7 +285,7 @@ ngx_int_t ngx_stream_core_preread_phase(ngx_stream_session_t *s,
 ngx_int_t ngx_stream_core_content_phase(ngx_stream_session_t *s,
     ngx_stream_phase_handler_t *ph);
 
-
+/**初始化连接**/
 void ngx_stream_init_connection(ngx_connection_t *c);
 void ngx_stream_session_handler(ngx_event_t *rev);
 void ngx_stream_finalize_session(ngx_stream_session_t *s, ngx_uint_t rc);

@@ -33,7 +33,9 @@ ngx_uint_t  ngx_stream_max_module;
 
 ngx_stream_filter_pt  ngx_stream_top_filter;
 
-
+/**
+ * 定义stream配置项
+ */ 
 static ngx_command_t  ngx_stream_commands[] = {
 
     { ngx_string("stream"),
@@ -46,7 +48,9 @@ static ngx_command_t  ngx_stream_commands[] = {
       ngx_null_command
 };
 
-
+/**
+ * 核心模块配置
+ */ 
 static ngx_core_module_t  ngx_stream_module_ctx = {
     ngx_string("stream"),
     NULL,
@@ -69,7 +73,9 @@ ngx_module_t  ngx_stream_module = {
     NGX_MODULE_V1_PADDING
 };
 
-
+/**
+ * 解析stream模块
+ */ 
 static char *
 ngx_stream_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -97,7 +103,7 @@ ngx_stream_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     *(ngx_stream_conf_ctx_t **) conf = ctx;
 
     /* count the number of the stream modules and set up their indices */
-
+    /* 计算stream模块数量 */
     ngx_stream_max_module = ngx_count_modules(cf->cycle, NGX_STREAM_MODULE);
 
 
@@ -133,14 +139,14 @@ ngx_stream_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
         module = cf->cycle->modules[m]->ctx;
         mi = cf->cycle->modules[m]->ctx_index;
-
+        /**main级别的配置项**/
         if (module->create_main_conf) {
             ctx->main_conf[mi] = module->create_main_conf(cf);
             if (ctx->main_conf[mi] == NULL) {
                 return NGX_CONF_ERROR;
             }
         }
-
+        /**server级别配置项**/
         if (module->create_srv_conf) {
             ctx->srv_conf[mi] = module->create_srv_conf(cf);
             if (ctx->srv_conf[mi] == NULL) {
@@ -159,7 +165,7 @@ ngx_stream_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         }
 
         module = cf->cycle->modules[m]->ctx;
-
+        /**解析配置之前**/
         if (module->preconfiguration) {
             if (module->preconfiguration(cf) != NGX_OK) {
                 return NGX_CONF_ERROR;
@@ -196,7 +202,7 @@ ngx_stream_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
         /* init stream{} main_conf's */
 
         cf->ctx = ctx;
-
+        /**初始化stream级别配置项**/
         if (module->init_main_conf) {
             rv = module->init_main_conf(cf, ctx->main_conf[mi]);
             if (rv != NGX_CONF_OK) {
@@ -222,11 +228,15 @@ ngx_stream_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
         }
     }
-
+    /**
+     * 初始化处理阶段
+     */ 
     if (ngx_stream_init_phases(cf, cmcf) != NGX_OK) {
         return NGX_CONF_ERROR;
     }
-
+    /**
+     * 解析完成的处理
+     */ 
     for (m = 0; cf->cycle->modules[m]; m++) {
         if (cf->cycle->modules[m]->type != NGX_STREAM_MODULE) {
             continue;
@@ -240,7 +250,7 @@ ngx_stream_block(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
             }
         }
     }
-
+    /**变量处理**/
     if (ngx_stream_variables_init_vars(cf) != NGX_OK) {
         return NGX_CONF_ERROR;
     }
@@ -376,7 +386,9 @@ ngx_stream_init_phase_handlers(ngx_conf_t *cf,
     return NGX_OK;
 }
 
-
+/**
+ * 端口处理
+ */ 
 static ngx_int_t
 ngx_stream_add_ports(ngx_conf_t *cf, ngx_array_t *ports,
     ngx_stream_listen_t *listen)
@@ -434,7 +446,9 @@ found:
     return NGX_OK;
 }
 
-
+/**
+ * 服务器初始化
+ */ 
 static char *
 ngx_stream_optimize_servers(ngx_conf_t *cf, ngx_array_t *ports)
 {
@@ -483,6 +497,7 @@ ngx_stream_optimize_servers(ngx_conf_t *cf, ngx_array_t *ports)
             }
 
             ls->addr_ntop = 1;
+            /**处理函数**/
             ls->handler = ngx_stream_init_connection;
             ls->pool_size = 256;
             ls->type = addr[i].opt.type;

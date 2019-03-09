@@ -15,7 +15,9 @@ ngx_os_io_t  ngx_io;
 
 static void ngx_drain_connections(ngx_cycle_t *cycle);
 
-
+/**
+ * 创建listening结构体
+ */ 
 ngx_listening_t *
 ngx_create_listening(ngx_conf_t *cf, struct sockaddr *sockaddr,
     socklen_t socklen)

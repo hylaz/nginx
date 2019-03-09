@@ -225,7 +225,7 @@ ngx_http_read_unbuffered_request_body(ngx_http_request_t *r)
         return rc;
     }
 #endif
-
+    //连接读取请求包体超时
     if (r->connection->read->timedout) {
         r->connection->timedout = 1;
         return NGX_HTTP_REQUEST_TIME_OUT;
@@ -240,7 +240,9 @@ ngx_http_read_unbuffered_request_body(ngx_http_request_t *r)
     return rc;
 }
 
-
+/**
+ * 读取包体超时
+ */ 
 static void
 ngx_http_read_client_request_body_handler(ngx_http_request_t *r)
 {

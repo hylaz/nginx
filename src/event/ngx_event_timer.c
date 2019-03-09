@@ -18,7 +18,9 @@ static ngx_rbtree_node_t  ngx_event_timer_sentinel;
  * it should not be a problem, because we use the rbtree to find
  * a minimum timer value only
  */
-
+/**
+ * 初始化定时器
+ */
 ngx_int_t
 ngx_event_timer_init(ngx_log_t *log)
 {

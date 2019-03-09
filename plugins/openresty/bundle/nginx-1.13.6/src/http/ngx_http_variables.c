@@ -648,7 +648,9 @@ ngx_http_get_flushed_variable(ngx_http_request_t *r, ngx_uint_t index)
     return ngx_http_get_indexed_variable(r, index);
 }
 
-
+/**
+ * 获取变量内容
+ */ 
 ngx_http_variable_value_t *
 ngx_http_get_variable(ngx_http_request_t *r, ngx_str_t *name, ngx_uint_t key)
 {

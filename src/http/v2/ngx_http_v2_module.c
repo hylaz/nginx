@@ -242,7 +242,9 @@ ngx_module_t  ngx_http_v2_module = {
     NGX_MODULE_V1_PADDING
 };
 
-
+/**
+ * 变量
+ */ 
 static ngx_http_variable_t  ngx_http_v2_vars[] = {
 
     { ngx_string("http2"), NULL,
@@ -251,7 +253,9 @@ static ngx_http_variable_t  ngx_http_v2_vars[] = {
       ngx_http_null_variable
 };
 
-
+/**
+ * 添加变量
+ */ 
 static ngx_int_t
 ngx_http_v2_add_variables(ngx_conf_t *cf)
 {
@@ -270,7 +274,9 @@ ngx_http_v2_add_variables(ngx_conf_t *cf)
     return NGX_OK;
 }
 
-
+/**
+ * http2变量获取
+ */ 
 static ngx_int_t
 ngx_http_v2_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data)
@@ -304,14 +310,18 @@ ngx_http_v2_variable(ngx_http_request_t *r,
     return NGX_OK;
 }
 
-
+/**
+ * 模块初始化
+ */ 
 static ngx_int_t
 ngx_http_v2_module_init(ngx_cycle_t *cycle)
 {
     return NGX_OK;
 }
 
-
+/**
+ * 创建ngx_http_v2_main_conf_t结构体
+ */ 
 static void *
 ngx_http_v2_create_main_conf(ngx_conf_t *cf)
 {
@@ -327,7 +337,9 @@ ngx_http_v2_create_main_conf(ngx_conf_t *cf)
     return h2mcf;
 }
 
-
+/**
+ * 初始化ngx_http_v2_main_conf_t结构体
+ */ 
 static char *
 ngx_http_v2_init_main_conf(ngx_conf_t *cf, void *conf)
 {
@@ -338,7 +350,9 @@ ngx_http_v2_init_main_conf(ngx_conf_t *cf, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * 创建ngx_http_v2_srv_conf_t结构体
+ */ 
 static void *
 ngx_http_v2_create_srv_conf(ngx_conf_t *cf)
 {
@@ -368,7 +382,9 @@ ngx_http_v2_create_srv_conf(ngx_conf_t *cf)
     return h2scf;
 }
 
-
+/**
+ * 合并ngx_http_v2_srv_conf_t结构体
+ */ 
 static char *
 ngx_http_v2_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -401,7 +417,9 @@ ngx_http_v2_merge_srv_conf(ngx_conf_t *cf, void *parent, void *child)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * 创建ngx_http_v2_loc_conf_t结构体
+ */ 
 static void *
 ngx_http_v2_create_loc_conf(ngx_conf_t *cf)
 {
@@ -426,7 +444,9 @@ ngx_http_v2_create_loc_conf(ngx_conf_t *cf)
     return h2lcf;
 }
 
-
+/**
+ * 合并ngx_http_v2_loc_conf_t结构体
+ */ 
 static char *
 ngx_http_v2_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -446,7 +466,9 @@ ngx_http_v2_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * http2_push配置解析项
+ */ 
 static char *
 ngx_http_v2_push(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {

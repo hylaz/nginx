@@ -225,7 +225,9 @@ static ngx_http_v2_parse_header_t  ngx_http_v2_parse_headers[] = {
     { ngx_null_string, 0, 0, NULL }
 };
 
-
+/**
+ * http2初始化
+ */ 
 void
 ngx_http_v2_init(ngx_event_t *rev)
 {

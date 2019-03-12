@@ -118,3 +118,6 @@
 	path = module/nginx-module-stream-sts
 	ignore=all
 	url = https://github.com/vozlt/nginx-module-stream-sts.git
+[submodule "module/nginx-module-sts"]
+	path = module/nginx-module-sts
+	url = https://github.com/vozlt/nginx-module-sts

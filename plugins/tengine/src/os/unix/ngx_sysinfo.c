@@ -11,7 +11,9 @@
 #include <sys/sysinfo.h>
 #endif
 
-
+/**
+ * 系统负载情况
+ */ 
 ngx_int_t
 ngx_getloadavg(ngx_int_t avg[], ngx_int_t nelem, ngx_log_t *log)
 {
@@ -60,7 +62,9 @@ static ngx_file_t                   ngx_meminfo_file;
 #define NGX_MEMINFO_FILE            "/proc/meminfo"
 #define NGX_MEMINFO_MAX_NAME_LEN    16
 
-
+/**
+ * 内存使用量
+ */ 
 ngx_int_t
 ngx_getmeminfo(ngx_meminfo_t *meminfo, ngx_log_t *log)
 {
@@ -240,7 +244,9 @@ static ngx_file_t                   ngx_cpuinfo_file;
 
 #define NGX_CPUINFO_FILE            "/proc/stat"
 
-
+/**
+ * 获取cpu信息
+ */ 
 ngx_int_t
 ngx_getcpuinfo(ngx_str_t *cpunumber, ngx_cpuinfo_t *cpuinfo, ngx_log_t *log)
 {

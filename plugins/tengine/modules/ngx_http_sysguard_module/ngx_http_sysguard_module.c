@@ -142,7 +142,9 @@ static ngx_command_t  ngx_http_sysguard_commands[] = {
       ngx_null_command
 };
 
-
+/**
+ * sysguard模块
+ */ 
 static ngx_http_module_t  ngx_http_sysguard_module_ctx = {
     NULL,                                   /* preconfiguration */
     ngx_http_sysguard_init,                 /* postconfiguration */
@@ -185,7 +187,9 @@ static ngx_cpuinfo_t ngx_http_sysguard_cached_cur_cputime;
 static ngx_int_t     ngx_http_sysguard_cached_swapstat;
 static size_t        ngx_http_sysguard_cached_free;
 
-
+/**
+ * 更新负载情况
+ */ 
 static ngx_int_t
 ngx_http_sysguard_update_load(ngx_http_request_t *r, time_t exptime)
 {
@@ -206,7 +210,9 @@ ngx_http_sysguard_update_load(ngx_http_request_t *r, time_t exptime)
     return NGX_OK;
 }
 
-
+/**
+ * cpuusage处理
+ */ 
 static ngx_int_t
 ngx_http_sysguard_update_cpuusage(ngx_http_request_t *r, time_t exptime)
 {
@@ -234,7 +240,9 @@ ngx_http_sysguard_update_cpuusage(ngx_http_request_t *r, time_t exptime)
     return NGX_OK;
 }
 
-
+/**
+ * 更新cpuinfo信息
+ */ 
 void
 ngx_http_sysguard_update_cpuinfo(ngx_http_request_t *r)
 {
@@ -270,7 +278,9 @@ ngx_http_sysguard_update_cpuinfo(ngx_http_request_t *r)
     return;
 }
 
-
+/**
+ * 更新内存使用
+ */ 
 static ngx_int_t
 ngx_http_sysguard_update_mem(ngx_http_request_t *r, time_t exptime)
 {
@@ -426,7 +436,9 @@ ngx_http_sysguard_update_rt_node(ngx_http_request_t *r)
     node->requests++;
 }
 
-
+/**
+ * 系统跳转
+ */ 
 static ngx_int_t
 ngx_http_sysguard_do_redirect(ngx_http_request_t *r, ngx_str_t *path)
 {
@@ -443,7 +455,9 @@ ngx_http_sysguard_do_redirect(ngx_http_request_t *r, ngx_str_t *path)
     return NGX_DONE;
 }
 
-
+/**
+ * sysguard_handler函数处理
+ */ 
 static ngx_int_t
 ngx_http_sysguard_handler(ngx_http_request_t *r)
 {
@@ -693,7 +707,9 @@ out:
     return NGX_DECLINED;
 }
 
-
+/**
+ * 创建ngx_http_sysguard_conf_t结构体
+ */  
 static void *
 ngx_http_sysguard_create_conf(ngx_conf_t *cf)
 {
@@ -729,7 +745,9 @@ ngx_http_sysguard_create_conf(ngx_conf_t *cf)
     return conf;
 }
 
-
+/**
+ * 合并配置项
+ */ 
 static char *
 ngx_http_sysguard_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -777,7 +795,9 @@ ngx_http_sysguard_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * sysguard_load配置项
+ */ 
 static char *
 ngx_http_sysguard_load(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -848,7 +868,9 @@ invalid:
     return NGX_CONF_ERROR;
 }
 
-
+/**
+ * sysguard_cpu配置项
+ */ 
 static char *
 ngx_http_sysguard_cpuusage(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -926,7 +948,9 @@ invalid:
     return NGX_CONF_ERROR;
 }
 
-
+/**
+ * sysguard_mem配置项
+ */ 
 static char *
 ngx_http_sysguard_mem(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -1022,7 +1046,9 @@ invalid:
     return NGX_CONF_ERROR;
 }
 
-
+/**
+ * sysguard_rt配置项
+ */ 
 static char *
 ngx_http_sysguard_rt(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -1088,7 +1114,9 @@ invalid:
     return NGX_CONF_ERROR;
 }
 
-
+/**
+ * 日志处理函数
+ */ 
 static ngx_int_t
 ngx_http_sysguard_log_handler(ngx_http_request_t *r)
 {
@@ -1097,7 +1125,9 @@ ngx_http_sysguard_log_handler(ngx_http_request_t *r)
     return NGX_OK;
 }
 
-
+/**
+ * 模块初始化
+ */ 
 static ngx_int_t
 ngx_http_sysguard_init(ngx_conf_t *cf)
 {

@@ -26,7 +26,7 @@
 #include <sys/socket.h>
 
 #ifdef USE_OPENSSL
-#include <openssl/ssl.h>
+#include <common/openssl-compat.h>
 #include <types/ssl_sock.h>
 #endif
 
@@ -87,7 +87,7 @@ enum li_state {
 /* listener socket options */
 #define LI_O_NONE               0x0000
 #define LI_O_NOLINGER           0x0001  /* disable linger on this socket */
-#define LI_O_FOREIGN            0x0002  /* permit listening on foreing addresses ("transparent") */
+#define LI_O_FOREIGN            0x0002  /* permit listening on foreign addresses ("transparent") */
 #define LI_O_NOQUICKACK         0x0004  /* disable quick ack of immediate data (linux) */
 #define LI_O_DEF_ACCEPT         0x0008  /* wait up to 1 second for data before accepting */
 #define LI_O_TCP_L4_RULES       0x0010  /* run TCP L4 rules checks on the incoming connection */
@@ -100,6 +100,8 @@ enum li_state {
 #define LI_O_V4V6               0x0800  /* bind to IPv4/IPv6 on Linux >= 2.4.21 */
 #define LI_O_ACC_CIP            0x1000  /* find the proxied address in the NetScaler Client IP header */
 #define LI_O_INHERITED          0x2000  /* inherited FD from the parent process (fd@) */
+#define LI_O_MWORKER            0x4000  /* keep the FD open in the master but close it in the children */
+#define LI_O_NOSTOP             0x8000  /* keep the listener active even after a soft stop */
 
 /* Note: if a listener uses LI_O_UNLIMITED, it is highly recommended that it adds its own
  * maxconn setting to the global.maxsock value so that its resources are reserved.
@@ -128,7 +130,7 @@ struct ssl_bind_conf {
 	char *ca_file;             /* CAfile to use on verify */
 	char *crl_file;            /* CRLfile to use on verify */
 	char *ciphers;             /* cipher suite to use if non-null */
-#if (OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined OPENSSL_IS_BORINGSSL && !defined LIBRESSL_VERSION_NUMBER)
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined OPENSSL_IS_BORINGSSL && !defined LIBRESSL_VERSION_NUMBER)
 	char *ciphersuites;        /* TLS 1.3 cipher suite to use if non-null */
 #endif
 	char *curves;	           /* curves suite to use for ECDHE */
@@ -159,24 +161,25 @@ struct bind_conf {
 	EVP_PKEY *ca_sign_pkey;    /* CA private key referenced by ca_key */
 #endif
 	struct proxy *frontend;    /* the frontend all these listeners belong to, or NULL */
+	const struct mux_proto_list *mux_proto; /* the mux to use for all incoming connections (specified by the "proto" keyword) */
 	struct xprt_ops *xprt;     /* transport-layer operations for all listeners */
 	int is_ssl;                /* SSL is required for these listeners */
 	int generate_certs;        /* 1 if generate-certificates option is set, else 0 */
+	int level;                 /* stats access level (ACCESS_LVL_*) */
+	int severity_output;       /* default severity output format in cli feedback messages */
+	struct list listeners;     /* list of listeners using this bind config */
 	unsigned long bind_proc;   /* bitmask of processes allowed to use these listeners */
-	unsigned long bind_thread[LONGBITS]; /* bitmask of threads (per processes) allowed to use these listeners */
+	unsigned long bind_thread; /* bitmask of threads allowed to use these listeners */
+	uint32_t ns_cip_magic;     /* Excepted NetScaler Client IP magic number */
+	struct list by_fe;         /* next binding for the same frontend, or NULL */
+	char *arg;                 /* argument passed to "bind" for better error reporting */
+	char *file;                /* file where the section appears */
+	int line;                  /* line where the section appears */
 	struct {                   /* UNIX socket permissions */
 		uid_t uid;         /* -1 to leave unchanged */
 		gid_t gid;         /* -1 to leave unchanged */
 		mode_t mode;       /* 0 to leave unchanged */
 	} ux;
-	int level;                 /* stats access level (ACCESS_LVL_*) */
-	int severity_output;       /* default severity output format in cli feedback messages */
-	struct list by_fe;         /* next binding for the same frontend, or NULL */
-	struct list listeners;     /* list of listeners using this bind config */
-	uint32_t ns_cip_magic;     /* Excepted NetScaler Client IP magic number */
-	char *arg;                 /* argument passed to "bind" for better error reporting */
-	char *file;                /* file where the section appears */
-	int line;                  /* line where the section appears */
 };
 
 /* The listener will be directly referenced by the fdtab[] which holds its
@@ -188,7 +191,6 @@ struct listener {
 	enum li_state state;            /* state: NEW, INIT, ASSIGNED, LISTEN, READY, FULL */
 	short int nice;                 /* nice value to assign to the instanciated tasks */
 	int fd;				/* the listen socket */
-	char *name;			/* listener's name */
 	int luid;			/* listener universally unique ID, used for SNMP */
 	int options;			/* socket options : LI_O_* */
 	struct fe_counters *counters;	/* statistics counters */
@@ -196,23 +198,31 @@ struct listener {
 	int nbconn;			/* current number of connections on this listener */
 	int maxconn;			/* maximum connections allowed on this listener */
 	unsigned int backlog;		/* if set, listen backlog */
-	unsigned int maxaccept;         /* if set, max number of connections accepted at once */
-	struct list proto_list;         /* list in the protocol header */
+	int maxaccept;         /* if set, max number of connections accepted at once (-1 when disabled) */
 	int (*accept)(struct listener *l, int fd, struct sockaddr_storage *addr); /* upper layer's accept() */
 	enum obj_type *default_target;  /* default target to use for accepted sessions or NULL */
+	/* cache line boundary */
 	struct list wait_queue;		/* link element to make the listener wait for something (LI_LIMITED)  */
+	unsigned int thr_idx;           /* thread indexes for queue distribution : (t2<<16)+t1 */
 	unsigned int analysers;		/* bitmap of required protocol analysers */
 	int maxseg;			/* for TCP, advertised MSS */
 	int tcp_ut;                     /* for TCP, user timeout */
 	char *interface;		/* interface name or NULL */
+	char *name;			/* listener's name */
 
 	__decl_hathreads(HA_SPINLOCK_T lock);
 
 	const struct netns_entry *netns; /* network namespace of the listener*/
 
+	/* cache line boundary */
+	unsigned int thr_conn[MAX_THREADS]; /* number of connections per thread */
+
+	/* cache line boundary */
+
 	struct list by_fe;              /* chaining in frontend's list of listeners */
 	struct list by_bind;            /* chaining in bind_conf's list of listeners */
 	struct bind_conf *bind_conf;	/* "bind" line settings, include SSL settings among other things */
+	struct list proto_list;         /* list in the protocol header */
 
 	/* warning: this struct is huge, keep it at the bottom */
 	struct sockaddr_storage addr;	/* the address we listen to */
@@ -260,6 +270,32 @@ struct xfer_sock_list {
 	struct xfer_sock_list *next;
 	struct sockaddr_storage addr;
 };
+
+/* This is used to create the accept queue, optimized to be 64 bytes long. */
+struct accept_queue_entry {
+	struct listener *listener;          // 8 bytes
+	int fd __attribute__((aligned(8))); // 4 bytes
+	int addr_len;                       // 4 bytes
+
+	union {
+		sa_family_t family;         // 2 bytes
+		struct sockaddr_in in;      // 16 bytes
+		struct sockaddr_in6 in6;    // 28 bytes
+	} addr; // this is normally 28 bytes
+	/* 20-bytes hole here */
+	char pad0[0] __attribute((aligned(64)));
+};
+
+/* The per-thread accept queue ring, must be a power of two minus 1 */
+#define ACCEPT_QUEUE_SIZE ((1<<8) - 1)
+
+struct accept_queue_ring {
+	unsigned int head;
+	unsigned int tail;
+	struct task *task;  /* task of the thread owning this ring */
+	struct accept_queue_entry entry[ACCEPT_QUEUE_SIZE] __attribute((aligned(64)));
+};
+
 
 #endif /* _TYPES_LISTENER_H */
 

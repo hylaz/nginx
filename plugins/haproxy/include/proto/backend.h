@@ -31,7 +31,7 @@
 #include <types/stream.h>
 
 int assign_server(struct stream *s);
-int assign_server_address(struct stream *s);
+int assign_server_address(struct stream *s, struct connection *srv_conn);
 int assign_server_and_queue(struct stream *s);
 int connect_server(struct stream *s);
 int srv_redispatch_connect(struct stream *t);
@@ -58,7 +58,7 @@ static inline int be_usable_srv(struct proxy *be)
 }
 
 /* set the time of last session on the backend */
-static void inline be_set_sess_last(struct proxy *be)
+static inline void be_set_sess_last(struct proxy *be)
 {
 	be->be_counters.last_sess = now.tv_sec;
 }
@@ -113,7 +113,8 @@ static inline int srv_currently_usable(const struct server *srv)
 }
 
 /* This function commits the next server state and weight onto the current
- * ones in order to detect future changes.
+ * ones in order to detect future changes. The server's lock is expected to
+ * be held when calling this function.
  */
 static inline void srv_lb_commit_status(struct server *srv)
 {

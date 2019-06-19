@@ -42,7 +42,7 @@
 #include <types/global.h>
 
 
-#if defined(CONFIG_HAP_LINUX_SPLICE)
+#if defined(USE_LINUX_SPLICE)
 #include <common/splice.h>
 
 /* A pipe contains 16 segments max, and it's common to see segments of 1448 bytes
@@ -54,23 +54,14 @@
  * infinite forwarding */
 #define MAX_SPLICE_AT_ONCE	(1<<30)
 
-/* Versions of splice between 2.6.25 and 2.6.27.12 were bogus and would return EAGAIN
- * on incoming shutdowns. On these versions, we have to call recv() after such a return
- * in order to find whether splice is OK or not. Since 2.6.27.13 we don't need to do
- * this anymore, and we can avoid this logic by defining ASSUME_SPLICE_WORKS.
- */
-
 /* Returns :
  *   -1 if splice() is not supported
  *   >= 0 to report the amount of spliced bytes.
  *   connection flags are updated (error, read0, wait_room, wait_data).
  *   The caller must have previously allocated the pipe.
  */
-int raw_sock_to_pipe(struct connection *conn, struct pipe *pipe, unsigned int count)
+int raw_sock_to_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe, unsigned int count)
 {
-#ifndef ASSUME_SPLICE_WORKS
-	static THREAD_LOCAL int splice_detects_close;
-#endif
 	int ret;
 	int retval = 0;
 
@@ -109,28 +100,18 @@ int raw_sock_to_pipe(struct connection *conn, struct pipe *pipe, unsigned int co
 			     SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
 
 		if (ret <= 0) {
-			if (ret == 0) {
-				/* connection closed. This is only detected by
-				 * recent kernels (>= 2.6.27.13). If we notice
-				 * it works, we store the info for later use.
-				 */
-#ifndef ASSUME_SPLICE_WORKS
-				splice_detects_close = 1;
-#endif
+			if (ret == 0)
 				goto out_read0;
-			}
 
 			if (errno == EAGAIN) {
 				/* there are two reasons for EAGAIN :
 				 *   - nothing in the socket buffer (standard)
 				 *   - pipe is full
-				 *   - the connection is closed (kernel < 2.6.27.13)
-				 * The last case is annoying but know if we can detect it
-				 * and if we can't then we rely on the call to recv() to
-				 * get a valid verdict. The difference between the first
-				 * two situations is problematic. Since we don't know if
-				 * the pipe is full, we'll stop if the pipe is not empty.
-				 * Anyway, we will almost always fill/empty the pipe.
+				 * The difference between these two situations
+				 * is problematic. Since we don't know if the
+				 * pipe is full, we'll stop if the pipe is not
+				 * empty. Anyway, we will almost always fill or
+				 * empty the pipe.
 				 */
 				if (pipe->data) {
 					/* alway stop reading until the pipe is flushed */
@@ -138,18 +119,7 @@ int raw_sock_to_pipe(struct connection *conn, struct pipe *pipe, unsigned int co
 					break;
 				}
 
-				/* We don't know if the connection was closed,
-				 * but if we know splice detects close, then we
-				 * know it for sure.
-				 * But if we're called upon POLLIN with an empty
-				 * pipe and get EAGAIN, it is suspect enough to
-				 * try to fall back to the normal recv scheme
-				 * which will be able to deal with the situation.
-				 */
-#ifndef ASSUME_SPLICE_WORKS
-				if (splice_detects_close)
-#endif
-					fd_cant_recv(conn->handle.fd); /* we know for sure that it's EAGAIN */
+				fd_cant_recv(conn->handle.fd);
 				break;
 			}
 			else if (errno == ENOSYS || errno == EINVAL || errno == EBADF) {
@@ -187,7 +157,14 @@ int raw_sock_to_pipe(struct connection *conn, struct pipe *pipe, unsigned int co
 		conn->flags &= ~CO_FL_WAIT_L4_CONN;
 
  leave:
-	conn_cond_update_sock_polling(conn);
+	if (retval > 0) {
+		/* we count the total bytes sent, and the send rate for 32-byte
+		 * blocks. The reason for the latter is that freq_ctr are
+		 * limited to 4GB and that it's not enough per second.
+		 */
+		_HA_ATOMIC_ADD(&global.out_bytes, retval);
+		update_freq_ctr(&global.out_32bps, (retval + 16) / 32);
+	}
 	return retval;
 
  out_read0:
@@ -198,7 +175,7 @@ int raw_sock_to_pipe(struct connection *conn, struct pipe *pipe, unsigned int co
 
 /* Send as many bytes as possible from the pipe to the connection's socket.
  */
-int raw_sock_from_pipe(struct connection *conn, struct pipe *pipe)
+int raw_sock_from_pipe(struct connection *conn, void *xprt_ctx, struct pipe *pipe)
 {
 	int ret, done;
 
@@ -233,11 +210,10 @@ int raw_sock_from_pipe(struct connection *conn, struct pipe *pipe)
 	if (unlikely(conn->flags & CO_FL_WAIT_L4_CONN) && done)
 		conn->flags &= ~CO_FL_WAIT_L4_CONN;
 
-	conn_cond_update_sock_polling(conn);
 	return done;
 }
 
-#endif /* CONFIG_HAP_LINUX_SPLICE */
+#endif /* USE_LINUX_SPLICE */
 
 
 /* Receive up to <count> bytes from connection <conn>'s socket and store them
@@ -250,10 +226,10 @@ int raw_sock_from_pipe(struct connection *conn, struct pipe *pipe)
  * errno is cleared before starting so that the caller knows that if it spots an
  * error without errno, it's pending and can be retrieved via getsockopt(SO_ERROR).
  */
-static int raw_sock_to_buf(struct connection *conn, struct buffer *buf, int count)
+static size_t raw_sock_to_buf(struct connection *conn, void *xprt_ctx, struct buffer *buf, size_t count, int flags)
 {
-	int ret, done = 0;
-	int try;
+	ssize_t ret;
+	size_t try, done = 0;
 
 	if (!conn_ctrl_ready(conn))
 		return 0;
@@ -276,31 +252,23 @@ static int raw_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 		}
 	}
 
-	/* let's realign the buffer to optimize I/O */
-	if (buffer_empty(buf))
-		buf->p = buf->data;
-
 	/* read the largest possible block. For this, we perform only one call
 	 * to recv() unless the buffer wraps and we exactly fill the first hunk,
 	 * in which case we accept to do it once again. A new attempt is made on
 	 * EINTR too.
 	 */
 	while (count > 0) {
-		/* first check if we have some room after p+i */
-		try = buf->data + buf->size - (buf->p + buf->i);
-		/* otherwise continue between data and p-o */
-		if (try <= 0) {
-			try = buf->p - (buf->data + buf->o);
-			if (try <= 0)
-				break;
-		}
+		try = b_contig_space(buf);
+		if (!try)
+			break;
+
 		if (try > count)
 			try = count;
 
-		ret = recv(conn->handle.fd, bi_end(buf), try, 0);
+		ret = recv(conn->handle.fd, b_tail(buf), try, 0);
 
 		if (ret > 0) {
-			buf->i += ret;
+			b_add(buf, ret);
 			done += ret;
 			if (ret < try) {
 				/* unfortunately, on level-triggered events, POLL_HUP
@@ -340,7 +308,6 @@ static int raw_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 		conn->flags &= ~CO_FL_WAIT_L4_CONN;
 
  leave:
-	conn_cond_update_sock_polling(conn);
 	return done;
 
  read0:
@@ -360,19 +327,22 @@ static int raw_sock_to_buf(struct connection *conn, struct buffer *buf, int coun
 }
 
 
-/* Send all pending bytes from buffer <buf> to connection <conn>'s socket.
- * <flags> may contain some CO_SFL_* flags to hint the system about other
- * pending data for example.
+/* Send up to <count> pending bytes from buffer <buf> to connection <conn>'s
+ * socket. <flags> may contain some CO_SFL_* flags to hint the system about
+ * other pending data for example, but this flag is ignored at the moment.
  * Only one call to send() is performed, unless the buffer wraps, in which case
  * a second call may be performed. The connection's flags are updated with
  * whatever special event is detected (error, empty). The caller is responsible
  * for taking care of those events and avoiding the call if inappropriate. The
  * function does not call the connection's polling update function, so the caller
- * is responsible for this.
+ * is responsible for this. It's up to the caller to update the buffer's contents
+ * based on the return value.
  */
-static int raw_sock_from_buf(struct connection *conn, struct buffer *buf, int flags)
+static size_t raw_sock_from_buf(struct connection *conn, void *xprt_ctx, const struct buffer *buf, size_t count, int flags)
 {
-	int ret, try, done, send_flag;
+	ssize_t ret;
+	size_t try, done;
+	int send_flag;
 
 	if (!conn_ctrl_ready(conn))
 		return 0;
@@ -386,31 +356,28 @@ static int raw_sock_from_buf(struct connection *conn, struct buffer *buf, int fl
 	 * to send() unless the buffer wraps and we exactly fill the first hunk,
 	 * in which case we accept to do it once again.
 	 */
-	while (buf->o) {
-		try = buf->o;
-		/* outgoing data may wrap at the end */
-		if (buf->data + try > buf->p)
-			try = buf->data + try - buf->p;
+	while (count) {
+		try = b_contig_data(buf, done);
+		if (try > count)
+			try = count;
 
 		send_flag = MSG_DONTWAIT | MSG_NOSIGNAL;
-		if (try < buf->o || flags & CO_SFL_MSG_MORE)
+		if (try < count || flags & CO_SFL_MSG_MORE)
 			send_flag |= MSG_MORE;
 
-		ret = send(conn->handle.fd, bo_ptr(buf), try, send_flag);
+		ret = send(conn->handle.fd, b_peek(buf, done), try, send_flag);
 
 		if (ret > 0) {
-			buf->o -= ret;
+			count -= ret;
 			done += ret;
 
-			if (likely(buffer_empty(buf)))
-				/* optimize data alignment in the buffer */
-				buf->p = buf->data;
-
+			/* A send succeeded, so we can consier ourself connected */
+			conn->flags |= CO_FL_CONNECTED;
 			/* if the system buffer is full, don't insist */
 			if (ret < try)
 				break;
 		}
-		else if (ret == 0 || errno == EAGAIN || errno == ENOTCONN) {
+		else if (ret == 0 || errno == EAGAIN || errno == ENOTCONN || errno == EINPROGRESS) {
 			/* nothing written, we need to poll for write first */
 			fd_cant_send(conn->handle.fd);
 			break;
@@ -423,16 +390,45 @@ static int raw_sock_from_buf(struct connection *conn, struct buffer *buf, int fl
 	if (unlikely(conn->flags & CO_FL_WAIT_L4_CONN) && done)
 		conn->flags &= ~CO_FL_WAIT_L4_CONN;
 
-	conn_cond_update_sock_polling(conn);
+	if (done > 0) {
+		/* we count the total bytes sent, and the send rate for 32-byte
+		 * blocks. The reason for the latter is that freq_ctr are
+		 * limited to 4GB and that it's not enough per second.
+		 */
+		_HA_ATOMIC_ADD(&global.out_bytes, done);
+		update_freq_ctr(&global.out_32bps, (done + 16) / 32);
+	}
 	return done;
 }
 
+static int raw_sock_subscribe(struct connection *conn, void *xprt_ctx, int event_type, void *param)
+{
+	return conn_subscribe(conn, xprt_ctx, event_type, param);
+}
+
+static int raw_sock_unsubscribe(struct connection *conn, void *xprt_ctx, int event_type, void *param)
+{
+	return conn_unsubscribe(conn, xprt_ctx, event_type, param);
+}
+
+/* We can't have an underlying XPRT, so just return -1 to signify failure */
+static int raw_sock_remove_xprt(struct connection *conn, void *xprt_ctx, void *toremove_ctx, const struct xprt_ops *newops, void *newctx)
+{
+	/* This is the lowest xprt we can have, so if we get there we didn't
+	 * find the xprt we wanted to remove, that's a bug
+	 */
+	BUG_ON(1);
+	return -1;
+}
 
 /* transport-layer operations for RAW sockets */
 static struct xprt_ops raw_sock = {
 	.snd_buf  = raw_sock_from_buf,
 	.rcv_buf  = raw_sock_to_buf,
-#if defined(CONFIG_HAP_LINUX_SPLICE)
+	.subscribe = raw_sock_subscribe,
+	.unsubscribe = raw_sock_unsubscribe,
+	.remove_xprt = raw_sock_remove_xprt,
+#if defined(USE_LINUX_SPLICE)
 	.rcv_pipe = raw_sock_to_pipe,
 	.snd_pipe = raw_sock_from_pipe,
 #endif

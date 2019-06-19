@@ -28,6 +28,9 @@
 #include <common/compat.h>
 #include <common/config.h>
 #include <common/debug.h>
+#include <common/http.h>
+#include <common/htx.h>
+#include <common/initcall.h>
 #include <common/memory.h>
 #include <common/mini-clist.h>
 #include <common/standard.h>
@@ -48,10 +51,12 @@
 #include <proto/checks.h>
 #include <proto/cli.h>
 #include <proto/compression.h>
+#include <proto/dns.h>
 #include <proto/stats.h>
 #include <proto/fd.h>
 #include <proto/freq_ctr.h>
 #include <proto/frontend.h>
+#include <proto/http_htx.h>
 #include <proto/log.h>
 #include <proto/pattern.h>
 #include <proto/pipe.h>
@@ -61,17 +66,25 @@
 #include <proto/proxy.h>
 #include <proto/sample.h>
 #include <proto/session.h>
+#include <proto/ssl_sock.h>
 #include <proto/stream.h>
 #include <proto/server.h>
 #include <proto/raw_sock.h>
 #include <proto/stream_interface.h>
 #include <proto/task.h>
 
-#ifdef USE_OPENSSL
-#include <proto/ssl_sock.h>
-#include <types/ssl_sock.h>
-#endif
 
+/* status codes available for the stats admin page (strictly 4 chars length) */
+const char *stat_status_codes[STAT_STATUS_SIZE] = {
+	[STAT_STATUS_DENY] = "DENY",
+	[STAT_STATUS_DONE] = "DONE",
+	[STAT_STATUS_ERRP] = "ERRP",
+	[STAT_STATUS_EXCD] = "EXCD",
+	[STAT_STATUS_NONE] = "NONE",
+	[STAT_STATUS_PART] = "PART",
+	[STAT_STATUS_UNKN] = "UNKN",
+	[STAT_STATUS_IVAL] = "IVAL",
+};
 
 /* These are the field names for each INF_* field position. Please pay attention
  * to always use the exact same name except that the strings for new names must
@@ -132,7 +145,15 @@ const char *info_field_names[INF_TOTAL_FIELDS] = {
 	[INF_DESCRIPTION]                    = "description",
 	[INF_STOPPING]                       = "Stopping",
 	[INF_JOBS]                           = "Jobs",
+	[INF_UNSTOPPABLE_JOBS]               = "Unstoppable Jobs",
 	[INF_LISTENERS]                      = "Listeners",
+	[INF_ACTIVE_PEERS]                   = "ActivePeers",
+	[INF_CONNECTED_PEERS]                = "ConnectedPeers",
+	[INF_DROPPED_LOGS]                   = "DroppedLogs",
+	[INF_BUSY_POLLING]                   = "BusyPolling",
+	[INF_FAILED_RESOLUTIONS]             = "FailedResolutions",
+	[INF_TOTAL_BYTES_OUT]                = "TotalBytesOut",
+	[INF_BYTES_OUT_RATE]                 = "BytesOutRate",
 };
 
 const char *stat_field_names[ST_F_TOTAL_FIELDS] = {
@@ -219,6 +240,11 @@ const char *stat_field_names[ST_F_TOTAL_FIELDS] = {
 	[ST_F_INTERCEPTED]    = "intercepted",
 	[ST_F_DCON]           = "dcon",
 	[ST_F_DSES]           = "dses",
+	[ST_F_WREW]           = "wrew",
+	[ST_F_CONNECT]        = "connect",
+	[ST_F_REUSE]          = "reuse",
+	[ST_F_CACHE_LOOKUPS]  = "cache_lookups",
+	[ST_F_CACHE_HITS]     = "cache_hits",
 };
 
 /* one line of info */
@@ -227,6 +253,44 @@ static THREAD_LOCAL struct field info[INF_TOTAL_FIELDS];
 static THREAD_LOCAL struct field stats[ST_F_TOTAL_FIELDS];
 
 
+static int stats_putchk(struct channel *chn, struct htx *htx, struct buffer *chk)
+{
+	if (htx) {
+		if (chk->data >= channel_htx_recv_max(chn, htx))
+			return 0;
+		if (!htx_add_data_atonce(htx, ist2(chk->area, chk->data)))
+			return 0;
+		channel_add_input(chn, chk->data);
+		chk->data = 0;
+	}
+	else  {
+		if (ci_putchk(chn, chk) == -1)
+			return 0;
+	}
+	return 1;
+}
+
+static const char *stats_scope_ptr(struct appctx *appctx, struct stream_interface *si)
+{
+	const char *p;
+
+	if (IS_HTX_STRM(si_strm(si))) {
+		struct channel *req = si_oc(si);
+		struct htx *htx = htxbuf(&req->buf);
+		struct htx_blk *blk;
+		struct ist uri;
+
+		blk = htx_get_head_blk(htx);
+		BUG_ON(htx_get_blk_type(blk) != HTX_BLK_REQ_SL);
+		ALREADY_CHECKED(blk);
+		uri = htx_sl_req_uri(htx_get_blk_ptr(htx, blk));
+		p = uri.ptr;
+	}
+	else
+		p = co_head(si_oc(si));
+
+	return p + appctx->ctx.stats.scope_str;
+}
 
 /*
  * http_stats_io_handler()
@@ -246,8 +310,6 @@ static THREAD_LOCAL struct field stats[ST_F_TOTAL_FIELDS];
  *        -> stats_dump_json_end()       // emits JSON trailer
  */
 
-
-extern const char *stat_status_codes[];
 
 /* Dumps the stats CSV header to the trash buffer which. The caller is responsible
  * for clearing it if needed.
@@ -269,7 +331,7 @@ static void stats_dump_csv_header()
 /* Emits a stats field without any surrounding element and properly encoded to
  * resist CSV output. Returns non-zero on success, 0 if the buffer is full.
  */
-int stats_emit_raw_data_field(struct chunk *out, const struct field *f)
+int stats_emit_raw_data_field(struct buffer *out, const struct field *f)
 {
 	switch (field_format(f, 0)) {
 	case FF_EMPTY: return 1;
@@ -286,7 +348,7 @@ int stats_emit_raw_data_field(struct chunk *out, const struct field *f)
  * output is supposed to be used on its own line. Returns non-zero on success, 0
  * if the buffer is full.
  */
-int stats_emit_typed_data_field(struct chunk *out, const struct field *f)
+int stats_emit_typed_data_field(struct buffer *out, const struct field *f)
 {
 	switch (field_format(f, 0)) {
 	case FF_EMPTY: return 1;
@@ -308,7 +370,7 @@ int stats_emit_typed_data_field(struct chunk *out, const struct field *f)
 /* Emits a stats field value and its type in JSON.
  * Returns non-zero on success, 0 on error.
  */
-int stats_emit_json_data_field(struct chunk *out, const struct field *f)
+int stats_emit_json_data_field(struct buffer *out, const struct field *f)
 {
 	int old_len;
 	char buf[20];
@@ -345,16 +407,17 @@ int stats_emit_json_data_field(struct chunk *out, const struct field *f)
 		       break;
 	}
 
-	old_len = out->len;
+	old_len = out->data;
 	chunk_appendf(out, ",\"value\":{\"type\":%s,\"value\":%s%s%s}",
 		      type, quote, value, quote);
-	return !(old_len == out->len);
+	return !(old_len == out->data);
 }
 
 /* Emits an encoding of the field type on 3 characters followed by a delimiter.
  * Returns non-zero on success, 0 if the buffer is full.
  */
-int stats_emit_field_tags(struct chunk *out, const struct field *f, char delim)
+int stats_emit_field_tags(struct buffer *out, const struct field *f,
+			  char delim)
 {
 	char origin, nature, scope;
 
@@ -397,7 +460,7 @@ int stats_emit_field_tags(struct chunk *out, const struct field *f, char delim)
 /* Emits an encoding of the field type as JSON.
   * Returns non-zero on success, 0 if the buffer is full.
   */
-int stats_emit_json_field_tags(struct chunk *out, const struct field *f)
+int stats_emit_json_field_tags(struct buffer *out, const struct field *f)
 {
 	const char *origin, *nature, *scope;
 	int old_len;
@@ -435,17 +498,18 @@ int stats_emit_json_field_tags(struct chunk *out, const struct field *f)
 	default:         scope = "Unknown"; break;
 	}
 
-	old_len = out->len;
+	old_len = out->data;
 	chunk_appendf(out, "\"tags\":{"
 			    "\"origin\":\"%s\","
 			    "\"nature\":\"%s\","
 			    "\"scope\":\"%s\""
 			   "}", origin, nature, scope);
-	return !(old_len == out->len);
+	return !(old_len == out->data);
 }
 
 /* Dump all fields from <stats> into <out> using CSV format */
-static int stats_dump_fields_csv(struct chunk *out, const struct field *stats)
+static int stats_dump_fields_csv(struct buffer *out,
+				 const struct field *stats)
 {
 	int field;
 
@@ -460,7 +524,8 @@ static int stats_dump_fields_csv(struct chunk *out, const struct field *stats)
 }
 
 /* Dump all fields from <stats> into <out> using a typed "field:desc:type:value" format */
-static int stats_dump_fields_typed(struct chunk *out, const struct field *stats)
+static int stats_dump_fields_typed(struct buffer *out,
+				   const struct field *stats)
 {
 	int field;
 
@@ -488,7 +553,7 @@ static int stats_dump_fields_typed(struct chunk *out, const struct field *stats)
 }
 
 /* Dump all fields from <stats> into <out> using the "show info json" format */
-static int stats_dump_json_info_fields(struct chunk *out,
+static int stats_dump_json_info_fields(struct buffer *out,
 				       const struct field *info)
 {
 	int field;
@@ -507,13 +572,13 @@ static int stats_dump_json_info_fields(struct chunk *out,
 			goto err;
 		started = 1;
 
-		old_len = out->len;
+		old_len = out->data;
 		chunk_appendf(out,
 			      "{\"field\":{\"pos\":%d,\"name\":\"%s\"},"
 			      "\"processNum\":%u,",
 			      field, info_field_names[field],
 			      info[INF_PROCESS_NUM].u.u32);
-		if (old_len == out->len)
+		if (old_len == out->data)
 			goto err;
 
 		if (!stats_emit_json_field_tags(out, &info[field]))
@@ -537,7 +602,8 @@ err:
 }
 
 /* Dump all fields from <stats> into <out> using a typed "field:desc:type:value" format */
-static int stats_dump_fields_json(struct chunk *out, const struct field *stats,
+static int stats_dump_fields_json(struct buffer *out,
+				  const struct field *stats,
 				  int first_stat)
 {
 	int field;
@@ -567,7 +633,7 @@ static int stats_dump_fields_json(struct chunk *out, const struct field *stats,
 		default:            obj_type = "Unknown";  break;
 		}
 
-		old_len = out->len;
+		old_len = out->data;
 		chunk_appendf(out,
 			      "{"
 				"\"objType\":\"%s\","
@@ -578,7 +644,7 @@ static int stats_dump_fields_json(struct chunk *out, const struct field *stats,
 			       obj_type, stats[ST_F_IID].u.u32,
 			       stats[ST_F_SID].u.u32, field,
 			       stat_field_names[field], stats[ST_F_PID].u.u32);
-		if (old_len == out->len)
+		if (old_len == out->data)
 			goto err;
 
 		if (!stats_emit_json_field_tags(out, &stats[field]))
@@ -608,9 +674,11 @@ err:
  * reserved for the checkbox is ST_SHOWADMIN is set in <flags>. Some extra info
  * are provided if ST_SHLGNDS is present in <flags>.
  */
-static int stats_dump_fields_html(struct chunk *out, const struct field *stats, unsigned int flags)
+static int stats_dump_fields_html(struct buffer *out,
+				  const struct field *stats,
+				  unsigned int flags)
 {
-	struct chunk src;
+	struct buffer src;
 
 	if (stats[ST_F_TYPE].u.u32 == STATS_TYPE_FE) {
 		chunk_appendf(out,
@@ -691,6 +759,9 @@ static int stats_dump_fields_html(struct chunk *out, const struct field *stats, 
 			              "<tr><th>- HTTP 5xx responses:</th><td>%s</td></tr>"
 			              "<tr><th>- other responses:</th><td>%s</td></tr>"
 			              "<tr><th>Intercepted requests:</th><td>%s</td></tr>"
+			              "<tr><th>Cache lookups:</th><td>%s</td></tr>"
+			              "<tr><th>Cache hits:</th><td>%s</td><td>(%d%%)</td></tr>"
+			              "<tr><th>Failed hdr rewrites:</th><td>%s</td></tr>"
 			              "",
 			              U2H(stats[ST_F_REQ_TOT].u.u64),
 			              U2H(stats[ST_F_HRSP_1XX].u.u64),
@@ -702,7 +773,12 @@ static int stats_dump_fields_html(struct chunk *out, const struct field *stats, 
 			              U2H(stats[ST_F_HRSP_4XX].u.u64),
 			              U2H(stats[ST_F_HRSP_5XX].u.u64),
 			              U2H(stats[ST_F_HRSP_OTHER].u.u64),
-			              U2H(stats[ST_F_INTERCEPTED].u.u64));
+			              U2H(stats[ST_F_INTERCEPTED].u.u64),
+			              U2H(stats[ST_F_CACHE_LOOKUPS].u.u64),
+			              U2H(stats[ST_F_CACHE_HITS].u.u64),
+			              stats[ST_F_CACHE_LOOKUPS].u.u64 ?
+			              (int)(100 * stats[ST_F_CACHE_HITS].u.u64 / stats[ST_F_CACHE_LOOKUPS].u.u64) : 0,
+			              U2H(stats[ST_F_WREW].u.u64));
 		}
 
 		chunk_appendf(out,
@@ -927,6 +1003,8 @@ static int stats_dump_fields_html(struct chunk *out, const struct field *stats, 
 			tot += stats[ST_F_HRSP_5XX].u.u64;
 
 			chunk_appendf(out,
+			              "<tr><th>New connections:</th><td>%s</td></tr>"
+			              "<tr><th>Reused connections:</th><td>%s</td><td>(%d%%)</td></tr>"
 			              "<tr><th>Cum. HTTP responses:</th><td>%s</td></tr>"
 			              "<tr><th>- HTTP 1xx responses:</th><td>%s</td><td>(%d%%)</td></tr>"
 			              "<tr><th>- HTTP 2xx responses:</th><td>%s</td><td>(%d%%)</td></tr>"
@@ -934,14 +1012,20 @@ static int stats_dump_fields_html(struct chunk *out, const struct field *stats, 
 			              "<tr><th>- HTTP 4xx responses:</th><td>%s</td><td>(%d%%)</td></tr>"
 			              "<tr><th>- HTTP 5xx responses:</th><td>%s</td><td>(%d%%)</td></tr>"
 			              "<tr><th>- other responses:</th><td>%s</td><td>(%d%%)</td></tr>"
+			              "<tr><th>Failed hdr rewrites:</th><td>%s</td></tr>"
 			              "",
+			              U2H(stats[ST_F_CONNECT].u.u64),
+			              U2H(stats[ST_F_REUSE].u.u64),
+			              (stats[ST_F_CONNECT].u.u64 + stats[ST_F_REUSE].u.u64) ?
+			              (int)(100 * stats[ST_F_REUSE].u.u64 / (stats[ST_F_CONNECT].u.u64 + stats[ST_F_REUSE].u.u64)) : 0,
 			              U2H(tot),
 			              U2H(stats[ST_F_HRSP_1XX].u.u64), tot ? (int)(100 * stats[ST_F_HRSP_1XX].u.u64 / tot) : 0,
 			              U2H(stats[ST_F_HRSP_2XX].u.u64), tot ? (int)(100 * stats[ST_F_HRSP_2XX].u.u64 / tot) : 0,
 			              U2H(stats[ST_F_HRSP_3XX].u.u64), tot ? (int)(100 * stats[ST_F_HRSP_3XX].u.u64 / tot) : 0,
 			              U2H(stats[ST_F_HRSP_4XX].u.u64), tot ? (int)(100 * stats[ST_F_HRSP_4XX].u.u64 / tot) : 0,
 			              U2H(stats[ST_F_HRSP_5XX].u.u64), tot ? (int)(100 * stats[ST_F_HRSP_5XX].u.u64 / tot) : 0,
-			              U2H(stats[ST_F_HRSP_OTHER].u.u64), tot ? (int)(100 * stats[ST_F_HRSP_OTHER].u.u64 / tot) : 0);
+			              U2H(stats[ST_F_HRSP_OTHER].u.u64), tot ? (int)(100 * stats[ST_F_HRSP_OTHER].u.u64 / tot) : 0,
+			              U2H(stats[ST_F_WREW].u.u64));
 		}
 
 		chunk_appendf(out, "<tr><th colspan=3>Avg over last 1024 success. conn.</th></tr>");
@@ -1145,6 +1229,8 @@ static int stats_dump_fields_html(struct chunk *out, const struct field *stats, 
 		/* http response (via hover): 1xx, 2xx, 3xx, 4xx, 5xx, other */
 		if (strcmp(field_str(stats, ST_F_MODE), "http") == 0) {
 			chunk_appendf(out,
+			              "<tr><th>New connections:</th><td>%s</td></tr>"
+			              "<tr><th>Reused connections:</th><td>%s</td><td>(%d%%)</td></tr>"
 			              "<tr><th>Cum. HTTP requests:</th><td>%s</td></tr>"
 			              "<tr><th>- HTTP 1xx responses:</th><td>%s</td></tr>"
 			              "<tr><th>- HTTP 2xx responses:</th><td>%s</td></tr>"
@@ -1153,8 +1239,15 @@ static int stats_dump_fields_html(struct chunk *out, const struct field *stats, 
 			              "<tr><th>- HTTP 4xx responses:</th><td>%s</td></tr>"
 			              "<tr><th>- HTTP 5xx responses:</th><td>%s</td></tr>"
 			              "<tr><th>- other responses:</th><td>%s</td></tr>"
+			              "<tr><th>Cache lookups:</th><td>%s</td></tr>"
+			              "<tr><th>Cache hits:</th><td>%s</td><td>(%d%%)</td></tr>"
+			              "<tr><th>Failed hdr rewrites:</th><td>%s</td></tr>"
 				      "<tr><th colspan=3>Avg over last 1024 success. conn.</th></tr>"
 			              "",
+			              U2H(stats[ST_F_CONNECT].u.u64),
+			              U2H(stats[ST_F_REUSE].u.u64),
+			              (stats[ST_F_CONNECT].u.u64 + stats[ST_F_REUSE].u.u64) ?
+			              (int)(100 * stats[ST_F_REUSE].u.u64 / (stats[ST_F_CONNECT].u.u64 + stats[ST_F_REUSE].u.u64)) : 0,
 			              U2H(stats[ST_F_REQ_TOT].u.u64),
 			              U2H(stats[ST_F_HRSP_1XX].u.u64),
 			              U2H(stats[ST_F_HRSP_2XX].u.u64),
@@ -1164,7 +1257,12 @@ static int stats_dump_fields_html(struct chunk *out, const struct field *stats, 
 			              U2H(stats[ST_F_HRSP_3XX].u.u64),
 			              U2H(stats[ST_F_HRSP_4XX].u.u64),
 			              U2H(stats[ST_F_HRSP_5XX].u.u64),
-			              U2H(stats[ST_F_HRSP_OTHER].u.u64));
+			              U2H(stats[ST_F_HRSP_OTHER].u.u64),
+			              U2H(stats[ST_F_CACHE_LOOKUPS].u.u64),
+			              U2H(stats[ST_F_CACHE_HITS].u.u64),
+			              stats[ST_F_CACHE_LOOKUPS].u.u64 ?
+			              (int)(100 * stats[ST_F_CACHE_HITS].u.u64 / stats[ST_F_CACHE_LOOKUPS].u.u64) : 0,
+			              U2H(stats[ST_F_WREW].u.u64));
 		}
 
 		chunk_appendf(out, "<tr><th>- Queue time:</th><td>%s</td><td>ms</td></tr>",   U2H(stats[ST_F_QTIME].u.u32));
@@ -1301,6 +1399,7 @@ int stats_fill_fe_stats(struct proxy *px, struct field *stats, int len)
 	stats[ST_F_RATE]     = mkf_u32(FN_RATE, read_freq_ctr(&px->fe_sess_per_sec));
 	stats[ST_F_RATE_LIM] = mkf_u32(FO_CONFIG|FN_LIMIT, px->fe_sps_lim);
 	stats[ST_F_RATE_MAX] = mkf_u32(FN_MAX, px->fe_counters.sps_max);
+	stats[ST_F_WREW]     = mkf_u64(FN_COUNTER, px->fe_counters.failed_rewrites);
 
 	/* http response: 1xx, 2xx, 3xx, 4xx, 5xx, other */
 	if (px->mode == PR_MODE_HTTP) {
@@ -1311,6 +1410,8 @@ int stats_fill_fe_stats(struct proxy *px, struct field *stats, int len)
 		stats[ST_F_HRSP_5XX]    = mkf_u64(FN_COUNTER, px->fe_counters.p.http.rsp[5]);
 		stats[ST_F_HRSP_OTHER]  = mkf_u64(FN_COUNTER, px->fe_counters.p.http.rsp[0]);
 		stats[ST_F_INTERCEPTED] = mkf_u64(FN_COUNTER, px->fe_counters.intercepted_req);
+		stats[ST_F_CACHE_LOOKUPS] = mkf_u64(FN_COUNTER, px->fe_counters.p.http.cache_lookups);
+		stats[ST_F_CACHE_HITS]    = mkf_u64(FN_COUNTER, px->fe_counters.p.http.cache_hits);
 	}
 
 	/* requests : req_rate, req_rate_max, req_tot, */
@@ -1361,7 +1462,7 @@ static int stats_dump_fe_stats(struct stream_interface *si, struct proxy *px)
 int stats_fill_li_stats(struct proxy *px, struct listener *l, int flags,
                         struct field *stats, int len)
 {
-	struct chunk *out = get_trash_chunk();
+	struct buffer *out = get_trash_chunk();
 
 	if (len < ST_F_TOTAL_FIELDS)
 		return 0;
@@ -1386,11 +1487,12 @@ int stats_fill_li_stats(struct proxy *px, struct listener *l, int flags,
 	stats[ST_F_EREQ]     = mkf_u64(FN_COUNTER, l->counters->failed_req);
 	stats[ST_F_DCON]     = mkf_u64(FN_COUNTER, l->counters->denied_conn);
 	stats[ST_F_DSES]     = mkf_u64(FN_COUNTER, l->counters->denied_sess);
-	stats[ST_F_STATUS]   = mkf_str(FO_STATUS, (l->nbconn < l->maxconn) ? (l->state == LI_LIMITED) ? "WAITING" : "OPEN" : "FULL");
+	stats[ST_F_STATUS]   = mkf_str(FO_STATUS, (!l->maxconn || l->nbconn < l->maxconn) ? (l->state == LI_LIMITED) ? "WAITING" : "OPEN" : "FULL");
 	stats[ST_F_PID]      = mkf_u32(FO_KEY, relative_pid);
 	stats[ST_F_IID]      = mkf_u32(FO_KEY|FS_SERVICE, px->uuid);
 	stats[ST_F_SID]      = mkf_u32(FO_KEY|FS_SERVICE, l->luid);
 	stats[ST_F_TYPE]     = mkf_u32(FO_CONFIG|FS_SERVICE, STATS_TYPE_SO);
+	stats[ST_F_WREW]     = mkf_u64(FN_COUNTER, l->counters->failed_rewrites);
 
 	if (flags & ST_SHLGNDS) {
 		char str[INET6_ADDRSTRLEN];
@@ -1477,7 +1579,7 @@ int stats_fill_sv_stats(struct proxy *px, struct server *sv, int flags,
 {
 	struct server *via, *ref;
 	char str[INET6_ADDRSTRLEN];
-	struct chunk *out = get_trash_chunk();
+	struct buffer *out = get_trash_chunk();
 	enum srv_stats_state state;
 	char *fld_status;
 
@@ -1556,6 +1658,9 @@ int stats_fill_sv_stats(struct proxy *px, struct server *sv, int flags,
 	stats[ST_F_ERESP]    = mkf_u64(FN_COUNTER, sv->counters.failed_resp);
 	stats[ST_F_WRETR]    = mkf_u64(FN_COUNTER, sv->counters.retries);
 	stats[ST_F_WREDIS]   = mkf_u64(FN_COUNTER, sv->counters.redispatches);
+	stats[ST_F_WREW]     = mkf_u64(FN_COUNTER, sv->counters.failed_rewrites);
+	stats[ST_F_CONNECT]  = mkf_u64(FN_COUNTER, sv->counters.connect);
+	stats[ST_F_REUSE]    = mkf_u64(FN_COUNTER, sv->counters.reuse);
 
 	/* status */
 	fld_status = chunk_newstr(out);
@@ -1748,6 +1853,9 @@ int stats_fill_be_stats(struct proxy *px, int flags, struct field *stats, int le
 	stats[ST_F_ERESP]    = mkf_u64(FN_COUNTER, px->be_counters.failed_resp);
 	stats[ST_F_WRETR]    = mkf_u64(FN_COUNTER, px->be_counters.retries);
 	stats[ST_F_WREDIS]   = mkf_u64(FN_COUNTER, px->be_counters.redispatches);
+	stats[ST_F_WREW]     = mkf_u64(FN_COUNTER, px->be_counters.failed_rewrites);
+	stats[ST_F_CONNECT]  = mkf_u64(FN_COUNTER, px->be_counters.connect);
+	stats[ST_F_REUSE]    = mkf_u64(FN_COUNTER, px->be_counters.reuse);
 	stats[ST_F_STATUS]   = mkf_str(FO_STATUS, (px->lbprm.tot_weight > 0 || !px->srv) ? "UP" : "DOWN");
 	stats[ST_F_WEIGHT]   = mkf_u32(FN_AVG, (px->lbprm.tot_weight * px->lbprm.wmult + px->lbprm.wdiv - 1) / px->lbprm.wdiv);
 	stats[ST_F_ACT]      = mkf_u32(0, px->srv_act);
@@ -1780,6 +1888,8 @@ int stats_fill_be_stats(struct proxy *px, int flags, struct field *stats, int le
 		stats[ST_F_HRSP_4XX]    = mkf_u64(FN_COUNTER, px->be_counters.p.http.rsp[4]);
 		stats[ST_F_HRSP_5XX]    = mkf_u64(FN_COUNTER, px->be_counters.p.http.rsp[5]);
 		stats[ST_F_HRSP_OTHER]  = mkf_u64(FN_COUNTER, px->be_counters.p.http.rsp[0]);
+		stats[ST_F_CACHE_LOOKUPS] = mkf_u64(FN_COUNTER, px->be_counters.p.http.cache_lookups);
+		stats[ST_F_CACHE_HITS]    = mkf_u64(FN_COUNTER, px->be_counters.p.http.cache_hits);
 	}
 
 	stats[ST_F_CLI_ABRT]     = mkf_u64(FN_COUNTER, px->be_counters.cli_aborts);
@@ -1835,8 +1945,10 @@ static void stats_dump_html_px_hdr(struct stream_interface *si, struct proxy *px
 		/* scope_txt = search pattern + search query, appctx->ctx.stats.scope_len is always <= STAT_SCOPE_TXT_MAXLEN */
 		scope_txt[0] = 0;
 		if (appctx->ctx.stats.scope_len) {
+			const char *scope_ptr = stats_scope_ptr(appctx, si);
+
 			strcpy(scope_txt, STAT_SCOPE_PATTERN);
-			memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), bo_ptr(si_ob(si)) + appctx->ctx.stats.scope_str, appctx->ctx.stats.scope_len);
+			memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), scope_ptr, appctx->ctx.stats.scope_len);
 			scope_txt[strlen(STAT_SCOPE_PATTERN) + appctx->ctx.stats.scope_len] = 0;
 		}
 
@@ -1949,7 +2061,8 @@ static void stats_dump_html_px_end(struct stream_interface *si, struct proxy *px
  * both by the CLI and the HTTP entry points, and is able to dump the output
  * in HTML or CSV formats. If the later, <uri> must be NULL.
  */
-int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy *px, struct uri_auth *uri)
+int stats_dump_proxy_to_buffer(struct stream_interface *si, struct htx *htx,
+			       struct proxy *px, struct uri_auth *uri)
 {
 	struct appctx *appctx = __objt_appctx(si->end);
 	struct stream *s = si_strm(si);
@@ -1997,9 +2110,12 @@ int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy *px, st
 		/* if the user has requested a limited output and the proxy
 		 * name does not match, skip it.
 		 */
-		if (appctx->ctx.stats.scope_len &&
-		    strnistr(px->id, strlen(px->id), bo_ptr(si_ob(si)) + appctx->ctx.stats.scope_str, appctx->ctx.stats.scope_len) == NULL)
-			return 1;
+		if (appctx->ctx.stats.scope_len) {
+			const char *scope_ptr = stats_scope_ptr(appctx, si);
+
+			if (strnistr(px->id, strlen(px->id), scope_ptr, appctx->ctx.stats.scope_len) == NULL)
+				return 1;
+		}
 
 		if ((appctx->ctx.stats.flags & STAT_BOUND) &&
 		    (appctx->ctx.stats.iid != -1) &&
@@ -2012,10 +2128,8 @@ int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy *px, st
 	case STAT_PX_ST_TH:
 		if (appctx->ctx.stats.flags & STAT_FMT_HTML) {
 			stats_dump_html_px_hdr(si, px, uri);
-			if (ci_putchk(rep, &trash) == -1) {
-				si_applet_cant_put(si);
-				return 0;
-			}
+			if (!stats_putchk(rep, htx, &trash))
+				goto full;
 		}
 
 		appctx->ctx.stats.px_st = STAT_PX_ST_FE;
@@ -2024,10 +2138,8 @@ int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy *px, st
 	case STAT_PX_ST_FE:
 		/* print the frontend */
 		if (stats_dump_fe_stats(si, px)) {
-			if (ci_putchk(rep, &trash) == -1) {
-				si_applet_cant_put(si);
-				return 0;
-			}
+			if (!stats_putchk(rep, htx, &trash))
+				goto full;
 		}
 
 		appctx->ctx.stats.l = px->conf.listeners.n;
@@ -2037,9 +2149,13 @@ int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy *px, st
 	case STAT_PX_ST_LI:
 		/* stats.l has been initialized above */
 		for (; appctx->ctx.stats.l != &px->conf.listeners; appctx->ctx.stats.l = l->by_fe.n) {
-			if (buffer_almost_full(rep->buf)) {
-				si_applet_cant_put(si);
-				return 0;
+			if (htx) {
+				if (htx_almost_full(htx))
+					goto full;
+			}
+			else {
+				if (buffer_almost_full(&rep->buf))
+					goto full;
 			}
 
 			l = LIST_ELEM(appctx->ctx.stats.l, struct listener *, by_fe);
@@ -2056,10 +2172,8 @@ int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy *px, st
 
 			/* print the frontend */
 			if (stats_dump_li_stats(si, px, l, flags)) {
-				if (ci_putchk(rep, &trash) == -1) {
-					si_applet_cant_put(si);
-					return 0;
-				}
+				if (!stats_putchk(rep, htx, &trash))
+					goto full;
 			}
 		}
 
@@ -2070,9 +2184,13 @@ int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy *px, st
 	case STAT_PX_ST_SV:
 		/* stats.sv has been initialized above */
 		for (; appctx->ctx.stats.sv != NULL; appctx->ctx.stats.sv = sv->next) {
-			if (buffer_almost_full(rep->buf)) {
-				si_applet_cant_put(si);
-				return 0;
+			if (htx) {
+				if (htx_almost_full(htx))
+					goto full;
+			}
+			else {
+				if (buffer_almost_full(&rep->buf))
+					goto full;
 			}
 
 			sv = appctx->ctx.stats.sv;
@@ -2100,10 +2218,8 @@ int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy *px, st
 			}
 
 			if (stats_dump_sv_stats(si, px, flags, sv)) {
-				if (ci_putchk(rep, &trash) == -1) {
-					si_applet_cant_put(si);
-					return 0;
-				}
+				if (!stats_putchk(rep, htx, &trash))
+					goto full;
 			}
 		} /* for sv */
 
@@ -2113,10 +2229,8 @@ int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy *px, st
 	case STAT_PX_ST_BE:
 		/* print the backend */
 		if (stats_dump_be_stats(si, px, flags)) {
-			if (ci_putchk(rep, &trash) == -1) {
-				si_applet_cant_put(si);
-				return 0;
-			}
+			if (!stats_putchk(rep, htx, &trash))
+				goto full;
 		}
 
 		appctx->ctx.stats.px_st = STAT_PX_ST_END;
@@ -2125,10 +2239,8 @@ int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy *px, st
 	case STAT_PX_ST_END:
 		if (appctx->ctx.stats.flags & STAT_FMT_HTML) {
 			stats_dump_html_px_end(si, px);
-			if (ci_putchk(rep, &trash) == -1) {
-				si_applet_cant_put(si);
-				return 0;
-			}
+			if (!stats_putchk(rep, htx, &trash))
+				goto full;
 		}
 
 		appctx->ctx.stats.px_st = STAT_PX_ST_FIN;
@@ -2141,6 +2253,10 @@ int stats_dump_proxy_to_buffer(struct stream_interface *si, struct proxy *px, st
 		/* unknown state, we should put an abort() here ! */
 		return 1;
 	}
+
+  full:
+	si_rx_room_blk(si);
+	return 0;
 }
 
 /* Dumps the HTTP stats head block to the trash for and uses the per-uri
@@ -2269,6 +2385,19 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 	struct appctx *appctx = __objt_appctx(si->end);
 	unsigned int up = (now.tv_sec - start_date.tv_sec);
 	char scope_txt[STAT_SCOPE_TXT_MAXLEN + sizeof STAT_SCOPE_PATTERN];
+	const char *scope_ptr = stats_scope_ptr(appctx, si);
+	unsigned long long bps = (unsigned long long)read_freq_ctr(&global.out_32bps) * 32;
+
+	/* Turn the bytes per second to bits per second and take care of the
+	 * usual ethernet overhead in order to help figure how far we are from
+	 * interface saturation since it's the only case which usually matters.
+	 * For this we count the total size of an Ethernet frame on the wire
+	 * including preamble and IFG (1538) for the largest TCP segment it
+	 * transports (1448 with TCP timestamps). This is not valid for smaller
+	 * packets (under-estimated), but it gives a reasonably accurate
+	 * estimation of how far we are from uplink saturation.
+	 */
+	bps = bps * 8 * 1538 / 1448;
 
 	/* WARNING! this has to fit the first packet too.
 	 * We are around 3.5 kB, add adding entries will
@@ -2285,7 +2414,7 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 	              "<b>uptime = </b> %dd %dh%02dm%02ds<br>\n"
 	              "<b>system limits:</b> memmax = %s%s; ulimit-n = %d<br>\n"
 	              "<b>maxsock = </b> %d; <b>maxconn = </b> %d; <b>maxpipes = </b> %d<br>\n"
-	              "current conns = %d; current pipes = %d/%d; conn rate = %d/sec<br>\n"
+	              "current conns = %d; current pipes = %d/%d; conn rate = %d/sec; bit rate = %.3f %cbps<br>\n"
 	              "Running tasks: %d/%d; idle = %d %%<br>\n"
 	              "</td><td align=\"center\" nowrap>\n"
 	              "<table class=\"lgd\"><tr>\n"
@@ -2310,7 +2439,7 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 	              "<td align=\"left\" valign=\"top\" nowrap width=\"1%%\">"
 	              "<b>Display option:</b><ul style=\"margin-top: 0.25em;\">"
 	              "",
-	              (uri->flags & ST_HIDEVER) ? "" : (STATS_VERSION_STRING),
+	              (uri->flags & ST_HIDEVER) ? "" : (stats_version_string),
 	              pid, (uri->flags & ST_SHNODE) ? " on " : "",
 		      (uri->flags & ST_SHNODE) ? (uri->node ? uri->node : global.node) : "",
 	              (uri->flags & ST_SHDESC) ? ": " : "",
@@ -2323,11 +2452,13 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 	              global.rlimit_nofile,
 	              global.maxsock, global.maxconn, global.maxpipes,
 	              actconn, pipes_used, pipes_used+pipes_free, read_freq_ctr(&global.conn_per_sec),
-	              tasks_run_queue_cur, nb_tasks_cur, idle_pct
+		      bps >= 1000000000UL ? (bps / 1000000000.0) : bps >= 1000000UL ? (bps / 1000000.0) : (bps / 1000.0),
+		      bps >= 1000000000UL ? 'G' : bps >= 1000000UL ? 'M' : 'k',
+	              tasks_run_queue_cur, nb_tasks_cur, ti->idle_pct
 	              );
 
 	/* scope_txt = search query, appctx->ctx.stats.scope_len is always <= STAT_SCOPE_TXT_MAXLEN */
-	memcpy(scope_txt, bo_ptr(si_ob(si)) + appctx->ctx.stats.scope_str, appctx->ctx.stats.scope_len);
+	memcpy(scope_txt, scope_ptr, appctx->ctx.stats.scope_len);
 	scope_txt[appctx->ctx.stats.scope_len] = '\0';
 
 	chunk_appendf(&trash,
@@ -2339,7 +2470,7 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 	scope_txt[0] = 0;
 	if (appctx->ctx.stats.scope_len) {
 		strcpy(scope_txt, STAT_SCOPE_PATTERN);
-		memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), bo_ptr(si_ob(si)) + appctx->ctx.stats.scope_str, appctx->ctx.stats.scope_len);
+		memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), scope_ptr, appctx->ctx.stats.scope_len);
 		scope_txt[strlen(STAT_SCOPE_PATTERN) + appctx->ctx.stats.scope_len] = 0;
 	}
 
@@ -2441,6 +2572,7 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 			              "Action not processed because of invalid parameters."
 			              "<ul>"
 			              "<li>The action is maybe unknown.</li>"
+				      "<li>Invalid key parameter (empty or too long).</li>"
 			              "<li>The backend name is probably unknown or ambiguous (duplicated names).</li>"
 			              "<li>Some server names are probably unknown or ambiguous (duplicated names in the backend).</li>"
 			              "</ul>"
@@ -2465,6 +2597,16 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 			              "<p><div class=active_down>"
 			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
 			              "<b>Action denied.</b>"
+			              "</div>\n", uri->uri_prefix,
+			              (appctx->ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
+			              (appctx->ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
+			              scope_txt);
+			break;
+		case STAT_STATUS_IVAL:
+			chunk_appendf(&trash,
+			              "<p><div class=active_down>"
+			              "<a class=lfsb href=\"%s%s%s%s\" title=\"Remove this message\">[X]</a> "
+			              "<b>Invalid requests (unsupported method or chunked encoded request).</b>"
 			              "</div>\n", uri->uri_prefix,
 			              (appctx->ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
 			              (appctx->ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
@@ -2516,7 +2658,8 @@ static void stats_dump_json_end()
  * and the stream must be closed, or -1 in case of any error. This function is
  * used by both the CLI and the HTTP handlers.
  */
-static int stats_dump_stat_to_buffer(struct stream_interface *si, struct uri_auth *uri)
+static int stats_dump_stat_to_buffer(struct stream_interface *si, struct htx *htx,
+				     struct uri_auth *uri)
 {
 	struct appctx *appctx = __objt_appctx(si->end);
 	struct channel *rep = si_ic(si);
@@ -2537,10 +2680,8 @@ static int stats_dump_stat_to_buffer(struct stream_interface *si, struct uri_aut
 		else if (!(appctx->ctx.stats.flags & STAT_FMT_TYPED))
 			stats_dump_csv_header();
 
-		if (ci_putchk(rep, &trash) == -1) {
-			si_applet_cant_put(si);
-			return 0;
-		}
+		if (!stats_putchk(rep, htx, &trash))
+			goto full;
 
 		appctx->st2 = STAT_ST_INFO;
 		/* fall through */
@@ -2548,10 +2689,8 @@ static int stats_dump_stat_to_buffer(struct stream_interface *si, struct uri_aut
 	case STAT_ST_INFO:
 		if (appctx->ctx.stats.flags & STAT_FMT_HTML) {
 			stats_dump_html_info(si, uri);
-			if (ci_putchk(rep, &trash) == -1) {
-				si_applet_cant_put(si);
-				return 0;
-			}
+			if (!stats_putchk(rep, htx, &trash))
+				goto full;
 		}
 
 		appctx->ctx.stats.px = proxies_list;
@@ -2562,15 +2701,19 @@ static int stats_dump_stat_to_buffer(struct stream_interface *si, struct uri_aut
 	case STAT_ST_LIST:
 		/* dump proxies */
 		while (appctx->ctx.stats.px) {
-			if (buffer_almost_full(rep->buf)) {
-				si_applet_cant_put(si);
-				return 0;
+			if (htx) {
+				if (htx_almost_full(htx))
+					goto full;
+			}
+			else {
+				if (buffer_almost_full(&rep->buf))
+					goto full;
 			}
 
 			px = appctx->ctx.stats.px;
 			/* skip the disabled proxies, global frontend and non-networked ones */
 			if (px->state != PR_STSTOPPED && px->uuid > 0 && (px->cap & (PR_CAP_FE | PR_CAP_BE)))
-				if (stats_dump_proxy_to_buffer(si, px, uri) == 0)
+				if (stats_dump_proxy_to_buffer(si, htx, px, uri) == 0)
 					return 0;
 
 			appctx->ctx.stats.px = px->next;
@@ -2587,10 +2730,8 @@ static int stats_dump_stat_to_buffer(struct stream_interface *si, struct uri_aut
 				stats_dump_html_end();
 			else
 				stats_dump_json_end();
-			if (ci_putchk(rep, &trash) == -1) {
-				si_applet_cant_put(si);
-				return 0;
-			}
+			if (!stats_putchk(rep, htx, &trash))
+				goto full;
 		}
 
 		appctx->st2 = STAT_ST_FIN;
@@ -2604,6 +2745,11 @@ static int stats_dump_stat_to_buffer(struct stream_interface *si, struct uri_aut
 		appctx->st2 = STAT_ST_FIN;
 		return -1;
 	}
+
+  full:
+	si_rx_room_blk(si);
+	return 0;
+
 }
 
 /* We reached the stats page through a POST request. The appctx is
@@ -2630,25 +2776,63 @@ static int stats_process_http_post(struct stream_interface *si)
 	char *st_cur_param = NULL;
 	char *st_next_param = NULL;
 
-	struct chunk *temp;
-	int reql;
+	struct buffer *temp = get_trash_chunk();
 
-	temp = get_trash_chunk();
-	if (temp->size < s->txn->req.body_len) {
-		/* too large request */
-		appctx->ctx.stats.st_code = STAT_STATUS_EXCD;
-		goto out;
+	if (IS_HTX_STRM(s)) {
+		struct htx *htx = htxbuf(&s->req.buf);
+		struct htx_blk *blk;
+
+		/*  we need more data */
+		if (s->txn->req.msg_state < HTTP_MSG_DONE) {
+			/* check if we can receive more */
+			if (htx_free_data_space(htx) <= global.tune.maxrewrite) {
+				appctx->ctx.stats.st_code = STAT_STATUS_EXCD;
+				goto out;
+			}
+			goto wait;
+		}
+
+		/* The request was fully received. Copy data */
+		blk = htx_get_head_blk(htx);
+		while (blk) {
+			enum htx_blk_type type = htx_get_blk_type(blk);
+
+			if (type == HTX_BLK_EOM || type == HTX_BLK_TLR || type == HTX_BLK_EOT)
+				break;
+			if (type == HTX_BLK_DATA) {
+				struct ist v = htx_get_blk_value(htx, blk);
+
+				if (!chunk_memcat(temp, v.ptr, v.len)) {
+					appctx->ctx.stats.st_code = STAT_STATUS_EXCD;
+					goto out;
+				}
+			}
+			blk = htx_get_next_blk(htx, blk);
+		}
 	}
+	else {
+		int reql;
 
-	reql = co_getblk(si_oc(si), temp->str, s->txn->req.body_len, s->txn->req.eoh + 2);
-	if (reql <= 0) {
 		/* we need more data */
-		appctx->ctx.stats.st_code = STAT_STATUS_NONE;
-		return 0;
+		if (s->txn->req.msg_state < HTTP_MSG_DONE) {
+			/* check if we can receive more */
+			if (c_room(&s->req) <= global.tune.maxrewrite) {
+				appctx->ctx.stats.st_code = STAT_STATUS_EXCD;
+				goto out;
+			}
+			goto wait;
+		}
+		reql = co_getblk(si_oc(si), temp->area, s->txn->req.body_len,
+				 s->txn->req.eoh + 2);
+		if (reql <= 0) {
+			appctx->ctx.stats.st_code = STAT_STATUS_EXCD;
+			goto out;
+		}
+		temp->data = reql;
 	}
 
-	first_param = temp->str;
-	end_params  = temp->str + reql;
+	first_param = temp->area;
+	end_params  = temp->area + temp->data;
 	cur_param = next_param = end_params;
 	*end_params = '\0';
 
@@ -2673,7 +2857,7 @@ static int stats_process_http_post(struct stream_interface *si)
 				strncpy(key, cur_param + poffset, plen);
 				key[plen - 1] = '\0';
 			} else {
-				appctx->ctx.stats.st_code = STAT_STATUS_EXCD;
+				appctx->ctx.stats.st_code = STAT_STATUS_ERRP;
 				goto out;
 			}
 
@@ -2929,14 +3113,124 @@ static int stats_process_http_post(struct stream_interface *si)
 	}
  out:
 	return 1;
+ wait:
+	appctx->ctx.stats.st_code = STAT_STATUS_NONE;
+	return 0;
 }
 
+
+static int stats_send_htx_headers(struct stream_interface *si, struct htx *htx)
+{
+	struct stream *s = si_strm(si);
+	struct uri_auth *uri = s->be->uri_auth;
+	struct appctx *appctx = __objt_appctx(si->end);
+	struct htx_sl *sl;
+	unsigned int flags;
+
+	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_ENC|HTX_SL_F_XFER_LEN|HTX_SL_F_CHNK);
+	sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags, ist("HTTP/1.1"), ist("200"), ist("OK"));
+	if (!sl)
+		goto full;
+	sl->info.res.status = 200;
+
+	if (!htx_add_header(htx, ist("Cache-Control"), ist("no-cache")))
+		goto full;
+	if (appctx->ctx.stats.flags & STAT_FMT_HTML) {
+		if (!htx_add_header(htx, ist("Content-Type"), ist("text/html")))
+			goto full;
+	}
+	else {
+		if (!htx_add_header(htx, ist("Content-Type"), ist("text/plain")))
+			goto full;
+	}
+
+	if (uri->refresh > 0 && !(appctx->ctx.stats.flags & STAT_NO_REFRESH)) {
+		const char *refresh = U2A(uri->refresh);
+		if (!htx_add_header(htx, ist("Refresh"), ist2(refresh, strlen(refresh))))
+			goto full;
+	}
+
+	if (appctx->ctx.stats.flags & STAT_CHUNKED) {
+		if (!htx_add_header(htx, ist("Transfer-Encoding"), ist("chunked")))
+			goto full;
+	}
+
+	if (!htx_add_endof(htx, HTX_BLK_EOH))
+		goto full;
+
+	channel_add_input(&s->res, htx->data);
+	return 1;
+
+  full:
+	htx_reset(htx);
+	si_rx_room_blk(si);
+	return 0;
+}
+
+
+static int stats_send_htx_redirect(struct stream_interface *si, struct htx *htx)
+{
+	char scope_txt[STAT_SCOPE_TXT_MAXLEN + sizeof STAT_SCOPE_PATTERN];
+	struct stream *s = si_strm(si);
+	struct uri_auth *uri = s->be->uri_auth;
+	struct appctx *appctx = __objt_appctx(si->end);
+	struct htx_sl *sl;
+	unsigned int flags;
+
+	/* scope_txt = search pattern + search query, appctx->ctx.stats.scope_len is always <= STAT_SCOPE_TXT_MAXLEN */
+	scope_txt[0] = 0;
+	if (appctx->ctx.stats.scope_len) {
+		const char *scope_ptr = stats_scope_ptr(appctx, si);
+
+		strcpy(scope_txt, STAT_SCOPE_PATTERN);
+		memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), scope_ptr, appctx->ctx.stats.scope_len);
+		scope_txt[strlen(STAT_SCOPE_PATTERN) + appctx->ctx.stats.scope_len] = 0;
+	}
+
+	/* We don't want to land on the posted stats page because a refresh will
+	 * repost the data. We don't want this to happen on accident so we redirect
+	 * the browse to the stats page with a GET.
+	 */
+	chunk_printf(&trash, "%s;st=%s%s%s%s",
+		     uri->uri_prefix,
+		     ((appctx->ctx.stats.st_code > STAT_STATUS_INIT) &&
+		      (appctx->ctx.stats.st_code < STAT_STATUS_SIZE) &&
+		      stat_status_codes[appctx->ctx.stats.st_code]) ?
+		     stat_status_codes[appctx->ctx.stats.st_code] :
+		     stat_status_codes[STAT_STATUS_UNKN],
+		     (appctx->ctx.stats.flags & STAT_HIDE_DOWN) ? ";up" : "",
+		     (appctx->ctx.stats.flags & STAT_NO_REFRESH) ? ";norefresh" : "",
+		     scope_txt);
+
+	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_CHNK);
+	sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags, ist("HTTP/1.1"), ist("303"), ist("See Other"));
+	if (!sl)
+		goto full;
+	sl->info.res.status = 303;
+
+	if (!htx_add_header(htx, ist("Cache-Control"), ist("no-cache")) ||
+	    !htx_add_header(htx, ist("Content-Type"), ist("text/plain")) ||
+	    !htx_add_header(htx, ist("Content-Length"), ist("0")) ||
+	    !htx_add_header(htx, ist("Location"), ist2(trash.area, trash.data)))
+		goto full;
+
+	if (!htx_add_endof(htx, HTX_BLK_EOH))
+		goto full;
+
+	channel_add_input(&s->res, htx->data);
+	return 1;
+
+full:
+	htx_reset(htx);
+	si_rx_room_blk(si);
+	return 0;
+}
 
 static int stats_send_http_headers(struct stream_interface *si)
 {
 	struct stream *s = si_strm(si);
 	struct uri_auth *uri = s->be->uri_auth;
-	struct appctx *appctx = objt_appctx(si->end);
+	struct appctx *appctx = __objt_appctx(si->end);
 
 	chunk_printf(&trash,
 		     "HTTP/1.1 200 OK\r\n"
@@ -2957,7 +3251,7 @@ static int stats_send_http_headers(struct stream_interface *si)
 		chunk_appendf(&trash, "\r\n");
 
 	if (ci_putchk(si_ic(si), &trash) == -1) {
-		si_applet_cant_put(si);
+		si_rx_room_blk(si);
 		return 0;
 	}
 
@@ -2969,13 +3263,13 @@ static int stats_send_http_redirect(struct stream_interface *si)
 	char scope_txt[STAT_SCOPE_TXT_MAXLEN + sizeof STAT_SCOPE_PATTERN];
 	struct stream *s = si_strm(si);
 	struct uri_auth *uri = s->be->uri_auth;
-	struct appctx *appctx = objt_appctx(si->end);
+	struct appctx *appctx = __objt_appctx(si->end);
 
 	/* scope_txt = search pattern + search query, appctx->ctx.stats.scope_len is always <= STAT_SCOPE_TXT_MAXLEN */
 	scope_txt[0] = 0;
 	if (appctx->ctx.stats.scope_len) {
 		strcpy(scope_txt, STAT_SCOPE_PATTERN);
-		memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), bo_ptr(si_ob(si)) + appctx->ctx.stats.scope_str, appctx->ctx.stats.scope_len);
+		memcpy(scope_txt + strlen(STAT_SCOPE_PATTERN), co_head(si_oc(si)) + appctx->ctx.stats.scope_str, appctx->ctx.stats.scope_len);
 		scope_txt[strlen(STAT_SCOPE_PATTERN) + appctx->ctx.stats.scope_len] = 0;
 	}
 
@@ -3002,11 +3296,104 @@ static int stats_send_http_redirect(struct stream_interface *si)
 		     scope_txt);
 
 	if (ci_putchk(si_ic(si), &trash) == -1) {
-		si_applet_cant_put(si);
+		si_rx_room_blk(si);
 		return 0;
 	}
 
 	return 1;
+}
+
+
+/* This I/O handler runs as an applet embedded in a stream interface. It is
+ * used to send HTTP stats over a TCP socket. The mechanism is very simple.
+ * appctx->st0 contains the operation in progress (dump, done). The handler
+ * automatically unregisters itself once transfer is complete.
+ */
+static void htx_stats_io_handler(struct appctx *appctx)
+{
+	struct stream_interface *si = appctx->owner;
+	struct stream *s = si_strm(si);
+	struct channel *req = si_oc(si);
+	struct channel *res = si_ic(si);
+	struct htx *req_htx, *res_htx;
+
+	res_htx = htx_from_buf(&res->buf);
+
+	if (unlikely(si->state == SI_ST_DIS || si->state == SI_ST_CLO))
+		goto out;
+
+	/* Check if the input buffer is avalaible. */
+	if (!b_size(&res->buf)) {
+		si_rx_room_blk(si);
+		goto out;
+	}
+
+	/* check that the output is not closed */
+	if (res->flags & (CF_SHUTW|CF_SHUTW_NOW|CF_SHUTR))
+		appctx->st0 = STAT_HTTP_END;
+
+	/* all states are processed in sequence */
+	if (appctx->st0 == STAT_HTTP_HEAD) {
+		if (stats_send_htx_headers(si, res_htx)) {
+			if (s->txn->meth == HTTP_METH_HEAD)
+				appctx->st0 = STAT_HTTP_DONE;
+			else
+				appctx->st0 = STAT_HTTP_DUMP;
+		}
+	}
+
+	if (appctx->st0 == STAT_HTTP_DUMP) {
+		if (stats_dump_stat_to_buffer(si, res_htx, s->be->uri_auth))
+			appctx->st0 = STAT_HTTP_DONE;
+	}
+
+	if (appctx->st0 == STAT_HTTP_POST) {
+		if (stats_process_http_post(si))
+			appctx->st0 = STAT_HTTP_LAST;
+		else if (req->flags & CF_SHUTR)
+			appctx->st0 = STAT_HTTP_DONE;
+	}
+
+	if (appctx->st0 == STAT_HTTP_LAST) {
+		if (stats_send_htx_redirect(si, res_htx))
+			appctx->st0 = STAT_HTTP_DONE;
+	}
+
+	if (appctx->st0 == STAT_HTTP_DONE) {
+		/* Don't add TLR because mux-h1 will take care of it */
+		if (!htx_add_endof(res_htx, HTX_BLK_EOM)) {
+			si_rx_room_blk(si);
+			goto out;
+		}
+		channel_add_input(&s->res, 1);
+		appctx->st0 = STAT_HTTP_END;
+	}
+
+	if (appctx->st0 == STAT_HTTP_END) {
+		if (!(res->flags & CF_SHUTR)) {
+			res->flags |= CF_READ_NULL;
+			si_shutr(si);
+		}
+
+		/* eat the whole request */
+		if (co_data(req)) {
+			req_htx = htx_from_buf(&req->buf);
+			co_htx_skip(req, req_htx, co_data(req));
+			htx_to_buf(req_htx, &req->buf);
+		}
+	}
+
+ out:
+	/* we have left the request in the buffer for the case where we
+	 * process a POST, and this automatically re-enables activity on
+	 * read. It's better to indicate that we want to stop reading when
+	 * we're sending, so that we know there's at most one direction
+	 * deciding to wake the applet up. It saves it from looping when
+	 * emitting large blocks into small TCP windows.
+	 */
+	htx_to_buf(res_htx, &res->buf);
+	if (!channel_is_empty(res))
+		si_stop_get(si);
 }
 
 
@@ -3022,18 +3409,23 @@ static void http_stats_io_handler(struct appctx *appctx)
 	struct channel *req = si_oc(si);
 	struct channel *res = si_ic(si);
 
+	if (IS_HTX_STRM(s))
+		return htx_stats_io_handler(appctx);
+
 	if (unlikely(si->state == SI_ST_DIS || si->state == SI_ST_CLO))
 		goto out;
 
-	/* Check if the input buffer is avalaible. */
-	if (res->buf->size == 0) {
-		si_applet_cant_put(si);
+	/* Check if the input buffer is available. */
+	if (res->buf.size == 0) {
+		/* already subscribed, we'll be called later once the buffer is
+		 * available.
+		 */
 		goto out;
 	}
 
 	/* check that the output is not closed */
-	if (res->flags & (CF_SHUTW|CF_SHUTW_NOW))
-		appctx->st0 = STAT_HTTP_DONE;
+	if (res->flags & (CF_SHUTW|CF_SHUTW_NOW|CF_SHUTR))
+		appctx->st0 = STAT_HTTP_END;
 
 	/* all states are processed in sequence */
 	if (appctx->st0 == STAT_HTTP_HEAD) {
@@ -3046,7 +3438,7 @@ static void http_stats_io_handler(struct appctx *appctx)
 	}
 
 	if (appctx->st0 == STAT_HTTP_DUMP) {
-		unsigned int prev_len = si_ib(si)->i;
+		unsigned int prev_len = ci_data(si_ic(si));
 		unsigned int data_len;
 		unsigned int last_len;
 		unsigned int last_fwd = 0;
@@ -3061,17 +3453,17 @@ static void http_stats_io_handler(struct appctx *appctx)
 			si_ic(si)->to_forward = 0;
 			chunk_printf(&trash, "\r\n000000\r\n");
 			if (ci_putchk(si_ic(si), &trash) == -1) {
-				si_applet_cant_put(si);
+				si_rx_room_blk(si);
 				si_ic(si)->to_forward = last_fwd;
 				goto out;
 			}
 		}
 
-		data_len = si_ib(si)->i;
-		if (stats_dump_stat_to_buffer(si, s->be->uri_auth))
+		data_len = ci_data(si_ic(si));
+		if (stats_dump_stat_to_buffer(si, NULL, s->be->uri_auth))
 			appctx->st0 = STAT_HTTP_DONE;
 
-		last_len = si_ib(si)->i;
+		last_len = ci_data(si_ic(si));
 
 		/* Now we must either adjust or remove the chunk size. This is
 		 * not easy because the chunk size might wrap at the end of the
@@ -3082,15 +3474,15 @@ static void http_stats_io_handler(struct appctx *appctx)
 		 */
 		if (appctx->ctx.stats.flags & STAT_CHUNKED) {
 			si_ic(si)->total -= (last_len - prev_len);
-			si_ib(si)->i     -= (last_len - prev_len);
+			b_sub(si_ib(si), (last_len - prev_len));
 
 			if (last_len != data_len) {
 				chunk_printf(&trash, "\r\n%06x\r\n", (last_len - data_len));
 				if (ci_putchk(si_ic(si), &trash) == -1)
-					si_applet_cant_put(si);
+					si_rx_room_blk(si);
 
 				si_ic(si)->total += (last_len - data_len);
-				si_ib(si)->i     += (last_len - data_len);
+				b_add(si_ib(si), last_len - data_len);
 			}
 			/* now re-enable forwarding */
 			channel_forward(si_ic(si), last_fwd);
@@ -3113,25 +3505,24 @@ static void http_stats_io_handler(struct appctx *appctx)
 		if (appctx->ctx.stats.flags & STAT_CHUNKED) {
 			chunk_printf(&trash, "\r\n0\r\n\r\n");
 			if (ci_putchk(si_ic(si), &trash) == -1) {
-				si_applet_cant_put(si);
+				si_rx_room_blk(si);
 				goto out;
 			}
 		}
-		/* eat the whole request */
-		co_skip(si_oc(si), si_ob(si)->o);
-		res->flags |= CF_READ_NULL;
-		si_shutr(si);
+		appctx->st0 = STAT_HTTP_END;
 	}
 
-	if ((res->flags & CF_SHUTR) && (si->state == SI_ST_EST))
-		si_shutw(si);
-
-	if (appctx->st0 == STAT_HTTP_DONE) {
-		if ((req->flags & CF_SHUTW) && (si->state == SI_ST_EST)) {
-			si_shutr(si);
+	if (appctx->st0 == STAT_HTTP_END) {
+		if (!(res->flags & CF_SHUTR)) {
 			res->flags |= CF_READ_NULL;
+			si_shutr(si);
 		}
+
+		/* eat the whole request */
+		if (co_data(req))
+			co_skip(si_oc(si), co_data(si_oc(si)));
 	}
+
  out:
 	/* we have left the request in the buffer for the case where we
 	 * process a POST, and this automatically re-enables activity on
@@ -3141,11 +3532,12 @@ static void http_stats_io_handler(struct appctx *appctx)
 	 * emitting large blocks into small TCP windows.
 	 */
 	if (!channel_is_empty(res))
-		si_applet_stop_get(si);
+		si_stop_get(si);
 }
 
 /* Dump all fields from <info> into <out> using the "show info" format (name: value) */
-static int stats_dump_info_fields(struct chunk *out, const struct field *info)
+static int stats_dump_info_fields(struct buffer *out,
+				  const struct field *info)
 {
 	int field;
 
@@ -3164,7 +3556,8 @@ static int stats_dump_info_fields(struct chunk *out, const struct field *info)
 }
 
 /* Dump all fields from <info> into <out> using the "show info typed" format */
-static int stats_dump_typed_info_fields(struct chunk *out, const struct field *info)
+static int stats_dump_typed_info_fields(struct buffer *out,
+					const struct field *info)
 {
 	int field;
 
@@ -3192,7 +3585,7 @@ static int stats_dump_typed_info_fields(struct chunk *out, const struct field *i
 int stats_fill_info(struct field *info, int len)
 {
 	unsigned int up = (now.tv_sec - start_date.tv_sec);
-	struct chunk *out = get_trash_chunk();
+	struct buffer *out = get_trash_chunk();
 
 #ifdef USE_OPENSSL
 	int ssl_sess_rate = read_freq_ctr(&global.ssl_per_sec);
@@ -3212,8 +3605,8 @@ int stats_fill_info(struct field *info, int len)
 	memset(info, 0, sizeof(*info) * len);
 
 	info[INF_NAME]                           = mkf_str(FO_PRODUCT|FN_OUTPUT|FS_SERVICE, PRODUCT_NAME);
-	info[INF_VERSION]                        = mkf_str(FO_PRODUCT|FN_OUTPUT|FS_SERVICE, HAPROXY_VERSION);
-	info[INF_RELEASE_DATE]                   = mkf_str(FO_PRODUCT|FN_OUTPUT|FS_SERVICE, HAPROXY_DATE);
+	info[INF_VERSION]                        = mkf_str(FO_PRODUCT|FN_OUTPUT|FS_SERVICE, haproxy_version);
+	info[INF_RELEASE_DATE]                   = mkf_str(FO_PRODUCT|FN_OUTPUT|FS_SERVICE, haproxy_date);
 
 	info[INF_NBTHREAD]                       = mkf_u32(FO_CONFIG|FS_SERVICE, global.nbthread);
 	info[INF_NBPROC]                         = mkf_u32(FO_CONFIG|FS_SERVICE, global.nbproc);
@@ -3271,13 +3664,21 @@ int stats_fill_info(struct field *info, int len)
 #endif
 	info[INF_TASKS]                          = mkf_u32(0, nb_tasks_cur);
 	info[INF_RUN_QUEUE]                      = mkf_u32(0, tasks_run_queue_cur);
-	info[INF_IDLE_PCT]                       = mkf_u32(FN_AVG, idle_pct);
+	info[INF_IDLE_PCT]                       = mkf_u32(FN_AVG, ti->idle_pct);
 	info[INF_NODE]                           = mkf_str(FO_CONFIG|FN_OUTPUT|FS_SERVICE, global.node);
 	if (global.desc)
 		info[INF_DESCRIPTION]            = mkf_str(FO_CONFIG|FN_OUTPUT|FS_SERVICE, global.desc);
 	info[INF_STOPPING]                       = mkf_u32(0, stopping);
 	info[INF_JOBS]                           = mkf_u32(0, jobs);
+	info[INF_UNSTOPPABLE_JOBS]               = mkf_u32(0, unstoppable_jobs);
 	info[INF_LISTENERS]                      = mkf_u32(0, listeners);
+	info[INF_ACTIVE_PEERS]                   = mkf_u32(0, active_peers);
+	info[INF_CONNECTED_PEERS]                = mkf_u32(0, connected_peers);
+	info[INF_DROPPED_LOGS]                   = mkf_u32(0, dropped_logs);
+	info[INF_BUSY_POLLING]                   = mkf_u32(0, !!(global.tune.options & GTUNE_BUSY_POLLING));
+	info[INF_FAILED_RESOLUTIONS]             = mkf_u32(0, dns_failed_resolutions);
+	info[INF_TOTAL_BYTES_OUT]                = mkf_u64(0, global.out_bytes);
+	info[INF_BYTES_OUT_RATE]                 = mkf_u64(FN_RATE, (unsigned long long)read_freq_ctr(&global.out_32bps) * 32);
 
 	return 1;
 }
@@ -3303,7 +3704,7 @@ static int stats_dump_info_to_buffer(struct stream_interface *si)
 		stats_dump_info_fields(&trash, info);
 
 	if (ci_putchk(si_ic(si), &trash) == -1) {
-		si_applet_cant_put(si);
+		si_rx_room_blk(si);
 		return 0;
 	}
 
@@ -3317,10 +3718,10 @@ static int stats_dump_info_to_buffer(struct stream_interface *si)
  * Integer values bouned to the range [-(2**53)+1, (2**53)-1] as
  * per the recommendation for interoperable integers in section 6 of RFC 7159.
  */
-static void stats_dump_json_schema(struct chunk *out)
+static void stats_dump_json_schema(struct buffer *out)
 {
 
-	int old_len = out->len;
+	int old_len = out->data;
 
 	chunk_strcat(out,
 		     "{"
@@ -3513,7 +3914,7 @@ static void stats_dump_json_schema(struct chunk *out)
 		      "}"
 		     "}");
 
-	if (old_len == out->len) {
+	if (old_len == out->data) {
 		chunk_reset(out);
 		chunk_appendf(out,
 			      "{\"errorStr\":\"output buffer too short\"}");
@@ -3531,14 +3932,14 @@ static int stats_dump_json_schema_to_buffer(struct stream_interface *si)
 	stats_dump_json_schema(&trash);
 
 	if (ci_putchk(si_ic(si), &trash) == -1) {
-		si_applet_cant_put(si);
+		si_rx_room_blk(si);
 		return 0;
 	}
 
 	return 1;
 }
 
-static int cli_parse_clear_counters(char **args, struct appctx *appctx, void *private)
+static int cli_parse_clear_counters(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct proxy *px;
 	struct server *sv;
@@ -3600,7 +4001,7 @@ static int cli_parse_clear_counters(char **args, struct appctx *appctx, void *pr
 }
 
 
-static int cli_parse_show_info(char **args, struct appctx *appctx, void *private)
+static int cli_parse_show_info(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	appctx->ctx.stats.scope_str = 0;
 	appctx->ctx.stats.scope_len = 0;
@@ -3614,7 +4015,7 @@ static int cli_parse_show_info(char **args, struct appctx *appctx, void *private
 }
 
 
-static int cli_parse_show_stat(char **args, struct appctx *appctx, void *private)
+static int cli_parse_show_stat(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	appctx->ctx.stats.scope_str = 0;
 	appctx->ctx.stats.scope_len = 0;
@@ -3662,7 +4063,7 @@ static int cli_io_handler_dump_info(struct appctx *appctx)
  */
 static int cli_io_handler_dump_stat(struct appctx *appctx)
 {
-	return stats_dump_stat_to_buffer(appctx->owner, NULL);
+	return stats_dump_stat_to_buffer(appctx->owner, NULL, NULL);
 }
 
 static int cli_io_handler_dump_json_schema(struct appctx *appctx)
@@ -3679,18 +4080,14 @@ static struct cli_kw_list cli_kws = {{ },{
 	{{},}
 }};
 
+INITCALL1(STG_REGISTER, cli_register_kw, &cli_kws);
+
 struct applet http_stats_applet = {
 	.obj_type = OBJ_TYPE_APPLET,
 	.name = "<STATS>", /* used for logging */
 	.fct = http_stats_io_handler,
 	.release = NULL,
 };
-
-__attribute__((constructor))
-static void __stat_init(void)
-{
-	cli_register_kw(&cli_kws);
-}
 
 /*
  * Local variables:

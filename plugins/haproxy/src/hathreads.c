@@ -10,161 +10,42 @@
  *
  */
 
+#define _GNU_SOURCE
 #include <unistd.h>
 #include <stdlib.h>
 #include <fcntl.h>
 
+#ifdef USE_CPU_AFFINITY
+#include <sched.h>
+#endif
+
+#ifdef __FreeBSD__
+#include <sys/cpuset.h>
+#endif
+
 #include <common/cfgparse.h>
 #include <common/hathreads.h>
 #include <common/standard.h>
+#include <types/global.h>
 #include <proto/fd.h>
 
-
-/* Dummy I/O handler used by the sync pipe.*/
-void thread_sync_io_handler(int fd)
-{
-}
+struct thread_info thread_info[MAX_THREADS] = { };
+THREAD_LOCAL struct thread_info *ti = &thread_info[0];
 
 #ifdef USE_THREAD
 
-static HA_SPINLOCK_T sync_lock;
-static int           threads_sync_pipe[2] = {-1, -1};
-volatile static unsigned long threads_want_sync = 0;
 volatile unsigned long threads_want_rdv_mask = 0;
 volatile unsigned long threads_harmless_mask = 0;
+volatile unsigned long threads_sync_mask = 0;
 volatile unsigned long all_threads_mask  = 1; // nbthread 1 assumed by default
 THREAD_LOCAL unsigned int  tid           = 0;
 THREAD_LOCAL unsigned long tid_bit       = (1UL << 0);
+int thread_cpus_enabled_at_boot          = 1;
 
 
 #if defined(DEBUG_THREAD) || defined(DEBUG_FULL)
 struct lock_stat lock_stats[LOCK_LABELS];
 #endif
-
-/* Initializes the sync point. It creates a pipe used by threads to wake up all
- * others when a sync is requested. It also initializes the mask of all created
- * threads. It returns 0 on success and -1 if an error occurred.
- */
-int thread_sync_init()
-{
-	int rfd;
-
-	if (pipe(threads_sync_pipe) < 0)
-		return -1;
-
-	rfd = threads_sync_pipe[0];
-	fcntl(rfd, F_SETFL, O_NONBLOCK);
-
-	fdtab[rfd].owner = thread_sync_io_handler;
-	fdtab[rfd].iocb = thread_sync_io_handler;
-	fd_insert(rfd, MAX_THREADS_MASK);
-	return 0;
-}
-
-/* Enables the sync point. */
-void thread_sync_enable(void)
-{
-	fd_want_recv(threads_sync_pipe[0]);
-}
-
-/* Called when a thread want to pass into the sync point. It subscribes the
- * current thread in threads waiting for sync by update a bit-field. It this is
- * the first one, it wakeup all other threads by writing on the sync pipe.
- */
-void thread_want_sync()
-{
-	if (all_threads_mask & (all_threads_mask - 1)) {
-		if (threads_want_sync & tid_bit)
-			return;
-		if (HA_ATOMIC_OR(&threads_want_sync, tid_bit) == tid_bit &&
-		    threads_sync_pipe[1] != -1)
-			shut_your_big_mouth_gcc(write(threads_sync_pipe[1], "S", 1));
-	}
-	else {
-		threads_want_sync = 1;
-	}
-}
-
-/* Returns 1 if no thread has requested a sync. Otherwise, it returns 0. */
-int thread_no_sync()
-{
-	return (threads_want_sync == 0UL);
-}
-
-/* Returns 1 if the current thread has requested a sync. Otherwise, it returns
- * 0.
- */
-int thread_need_sync()
-{
-	return ((threads_want_sync & tid_bit) != 0UL);
-}
-
-/* Thread barrier. Synchronizes all threads at the barrier referenced by
- * <barrier>. The calling thread shall block until all other threads have called
- * thread_sync_barrier specifying the same barrier.
- *
- * If you need to use several barriers at differnt points, you need to use a
- * different <barrier> for each point.
- */
-static inline void thread_sync_barrier(volatile unsigned long *barrier)
-{
-	unsigned long old = all_threads_mask;
-
-	HA_ATOMIC_CAS(barrier, &old, 0);
-	HA_ATOMIC_OR(barrier, tid_bit);
-
-	/* Note below: we need to wait for all threads to join here, but in
-	 * case several threads are scheduled on the same CPU, busy polling
-	 * will instead degrade the performance, forcing other threads to
-	 * wait longer (typically in epoll_wait()). Let's use sched_yield()
-	 * when available instead.
-	 */
-	while ((*barrier & all_threads_mask) != all_threads_mask) {
-#if _POSIX_PRIORITY_SCHEDULING
-		sched_yield();
-#else
-		pl_cpu_relax();
-#endif
-	}
-}
-
-/* Enter into the sync point and lock it if the current thread has requested a
- * sync. */
-void thread_enter_sync()
-{
-	static volatile unsigned long barrier = 0;
-
-	if (!(all_threads_mask & (all_threads_mask - 1)))
-		return;
-
-	thread_sync_barrier(&barrier);
-	if (threads_want_sync & tid_bit)
-		HA_SPIN_LOCK(THREAD_SYNC_LOCK, &sync_lock);
-}
-
-/* Exit from the sync point and unlock it if it was previously locked. If the
- * current thread is the last one to have requested a sync, the sync pipe is
- * flushed.
- */
-void thread_exit_sync()
-{
-	static volatile unsigned long barrier = 0;
-
-	if (!(all_threads_mask & (all_threads_mask - 1)))
-		return;
-
-	if (threads_want_sync & tid_bit)
-		HA_SPIN_UNLOCK(THREAD_SYNC_LOCK, &sync_lock);
-
-	if (HA_ATOMIC_AND(&threads_want_sync, ~tid_bit) == 0) {
-		char c;
-
-		shut_your_big_mouth_gcc(read(threads_sync_pipe[0], &c, 1));
-		fd_done_recv(threads_sync_pipe[0]);
-	}
-
-	thread_sync_barrier(&barrier);
-}
 
 /* Marks the thread as harmless until the last thread using the rendez-vous
  * point quits. Given that we can wait for a long time, sched_yield() is used
@@ -172,13 +53,9 @@ void thread_exit_sync()
  */
 void thread_harmless_till_end()
 {
-		HA_ATOMIC_OR(&threads_harmless_mask, tid_bit);
+		_HA_ATOMIC_OR(&threads_harmless_mask, tid_bit);
 		while (threads_want_rdv_mask & all_threads_mask) {
-#if _POSIX_PRIORITY_SCHEDULING
-			sched_yield();
-#else
-			pl_cpu_relax();
-#endif
+			ha_thread_relax();
 		}
 }
 
@@ -191,23 +68,19 @@ void thread_isolate()
 {
 	unsigned long old;
 
-	HA_ATOMIC_OR(&threads_harmless_mask, tid_bit);
-	__ha_barrier_store();
-	HA_ATOMIC_OR(&threads_want_rdv_mask, tid_bit);
+	_HA_ATOMIC_OR(&threads_harmless_mask, tid_bit);
+	__ha_barrier_atomic_store();
+	_HA_ATOMIC_OR(&threads_want_rdv_mask, tid_bit);
 
 	/* wait for all threads to become harmless */
 	old = threads_harmless_mask;
 	while (1) {
 		if (unlikely((old & all_threads_mask) != all_threads_mask))
 			old = threads_harmless_mask;
-		else if (HA_ATOMIC_CAS(&threads_harmless_mask, &old, old & ~tid_bit))
+		else if (_HA_ATOMIC_CAS(&threads_harmless_mask, &old, old & ~tid_bit))
 			break;
 
-#if _POSIX_PRIORITY_SCHEDULING
-		sched_yield();
-#else
-		pl_cpu_relax();
-#endif
+		ha_thread_relax();
 	}
 	/* one thread gets released at a time here, with its harmess bit off.
 	 * The loss of this bit makes the other one continue to spin while the
@@ -221,19 +94,127 @@ void thread_isolate()
  */
 void thread_release()
 {
-	HA_ATOMIC_AND(&threads_want_rdv_mask, ~tid_bit);
-	thread_harmless_end();
+	_HA_ATOMIC_AND(&threads_want_rdv_mask, ~tid_bit);
+	while (threads_want_rdv_mask & all_threads_mask) {
+		_HA_ATOMIC_OR(&threads_harmless_mask, tid_bit);
+		while (threads_want_rdv_mask & all_threads_mask)
+			ha_thread_relax();
+		HA_ATOMIC_AND(&threads_harmless_mask, ~tid_bit);
+	}
+}
+
+/* Cancels the effect of thread_isolate() by releasing the current thread's bit
+ * in threads_want_rdv_mask and by marking this thread as harmless until the
+ * last worker finishes. The difference with thread_release() is that this one
+ * will not leave the function before others are notified to do the same, so it
+ * guarantees that the current thread will not pass through a subsequent call
+ * to thread_isolate() before others finish.
+ */
+void thread_sync_release()
+{
+	_HA_ATOMIC_OR(&threads_sync_mask, tid_bit);
+	__ha_barrier_atomic_store();
+	_HA_ATOMIC_AND(&threads_want_rdv_mask, ~tid_bit);
+
+	while (threads_want_rdv_mask & all_threads_mask) {
+		_HA_ATOMIC_OR(&threads_harmless_mask, tid_bit);
+		while (threads_want_rdv_mask & all_threads_mask)
+			ha_thread_relax();
+		HA_ATOMIC_AND(&threads_harmless_mask, ~tid_bit);
+	}
+
+	/* the current thread is not harmless anymore, thread_isolate()
+	 * is forced to wait till all waiters finish.
+	 */
+	_HA_ATOMIC_AND(&threads_sync_mask, ~tid_bit);
+	while (threads_sync_mask & all_threads_mask)
+		ha_thread_relax();
+}
+
+/* send signal <sig> to thread <thr> */
+void ha_tkill(unsigned int thr, int sig)
+{
+	pthread_kill(thread_info[thr].pthread, sig);
+}
+
+/* send signal <sig> to all threads. The calling thread is signaled last in
+ * order to allow all threads to synchronize in the handler.
+ */
+void ha_tkillall(int sig)
+{
+	unsigned int thr;
+
+	for (thr = 0; thr < global.nbthread; thr++) {
+		if (!(all_threads_mask & (1UL << thr)))
+			continue;
+		if (thr == tid)
+			continue;
+		pthread_kill(thread_info[thr].pthread, sig);
+	}
+	raise(sig);
+}
+
+/* these calls are used as callbacks at init time */
+void ha_spin_init(HA_SPINLOCK_T *l)
+{
+	HA_SPIN_INIT(l);
+}
+
+/* these calls are used as callbacks at init time */
+void ha_rwlock_init(HA_RWLOCK_T *l)
+{
+	HA_RWLOCK_INIT(l);
+}
+
+/* returns the number of CPUs the current process is enabled to run on */
+static int thread_cpus_enabled()
+{
+	int ret = 1;
+
+#ifdef USE_CPU_AFFINITY
+#if defined(__linux__) && defined(CPU_COUNT)
+	cpu_set_t mask;
+
+	if (sched_getaffinity(0, sizeof(mask), &mask) == 0)
+		ret = CPU_COUNT(&mask);
+#elif defined(__FreeBSD__) && defined(USE_CPU_AFFINITY)
+	cpuset_t cpuset;
+	if (cpuset_getaffinity(CPU_LEVEL_CPUSET, CPU_WHICH_PID, -1,
+	    sizeof(cpuset), &cpuset) == 0)
+		ret = CPU_COUNT(&cpuset);
+#endif
+#endif
+	ret = MAX(ret, 1);
+	ret = MIN(ret, MAX_THREADS);
+	return ret;
 }
 
 __attribute__((constructor))
 static void __hathreads_init(void)
 {
-	HA_SPIN_INIT(&sync_lock);
+	char *ptr = NULL;
+
+	if (MAX_THREADS < 1 || MAX_THREADS > LONGBITS) {
+		ha_alert("MAX_THREADS value must be between 1 and %d inclusive; "
+		         "HAProxy was built with value %d, please fix it and rebuild.\n",
+			 LONGBITS, MAX_THREADS);
+		exit(1);
+	}
+
+	thread_cpus_enabled_at_boot = thread_cpus_enabled();
+
+	memprintf(&ptr, "Built with multi-threading support (MAX_THREADS=%d, default=%d).",
+		  MAX_THREADS, thread_cpus_enabled_at_boot);
+	hap_register_build_opts(ptr, 1);
+
 #if defined(DEBUG_THREAD) || defined(DEBUG_FULL)
 	memset(lock_stats, 0, sizeof(lock_stats));
 #endif
-	hap_register_build_opts("Built with multi-threading support.", 0);
 }
+
+#else
+
+REGISTER_BUILD_OPTS("Built without multi-threading support (USE_THREAD not set).");
 
 #endif // USE_THREAD
 
@@ -264,9 +245,7 @@ int parse_nbthread(const char *arg, char **err)
 		return 0;
 	}
 
-	/* we proceed like this to be sure never to overflow the left shift */
-	all_threads_mask = 1UL << (nbthread - 1);
-	all_threads_mask |= all_threads_mask - 1;
+	all_threads_mask = nbits(nbthread);
 #endif
 	return nbthread;
 }

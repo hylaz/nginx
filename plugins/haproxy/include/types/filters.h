@@ -120,21 +120,26 @@ struct flt_kw_list {
  *                          headers was parsed and analyzed.
  *                          Returns a negative value if an error occurs, 0 if
  *                          it needs to wait, any other value otherwise.
+ *  - http_payload        : Called when some data can be consumed.
+ *                          Returns a negative value if an error occurs, else
+ *                          the number of forwarded bytes.
  *  - http_data           : Called when unparsed body data are available.
  *                          Returns a negative value if an error occurs, else
- *                          the number of consumed bytes.
+ *                          the number of consumed bytes. [DEPRECATED]
  *  - http_chunk_trailers : Called when part of trailer headers of a
  *                          chunk-encoded request/response are ready to be
  *                          processed.
  *                          Returns a negative value if an error occurs, any
- *                          other value otherwise.
+ *                          other value otherwise. [DEPRECATED]
  *  - http_end            : Called when all the request/response has been
  *                          processed and all body data has been forwarded.
  *                          Returns a negative value if an error occurs, 0 if
  *                          it needs to wait for some reason, any other value
  *                          otherwise.
  *  - http_reset          : Called when the HTTP message is reseted. It happens
- *                          when a 100-continue response is received.
+ *                          either when a 100-continue response is received.
+ *                          that can be detected if s->txn->status is 10X, or
+ *                          if we're attempting a L7 retry.
  *                          Returns nothing.
  *  - http_reply          : Called when, at any time, HA proxy decides to stop
  *                          the HTTP message's processing and to send a message
@@ -143,7 +148,7 @@ struct flt_kw_list {
  *                          Returns nothing.
  *  - http_forward_data   : Called when some data can be consumed.
  *                          Returns a negative value if an error occurs, else
- *                          the number of forwarded bytes.
+ *                          the number of forwarded bytes. [DEPRECATED]
  *  - tcp_data            : Called when unparsed data are available.
  *                          Returns a negative value if an error occurs, else
  *                          the number of consumed bytes.
@@ -181,15 +186,17 @@ struct flt_ops {
 	 * HTTP callbacks
 	 */
 	int  (*http_headers)       (struct stream *s, struct filter *f, struct http_msg *msg);
-	int  (*http_data)          (struct stream *s, struct filter *f, struct http_msg *msg);
-	int  (*http_chunk_trailers)(struct stream *s, struct filter *f, struct http_msg *msg);
+	int  (*http_payload)       (struct stream *s, struct filter *f, struct http_msg *msg,
+				    unsigned int offset, unsigned int len);
 	int  (*http_end)           (struct stream *s, struct filter *f, struct http_msg *msg);
-	int  (*http_forward_data)  (struct stream *s, struct filter *f, struct http_msg *msg,
+	int  (*http_data)          (struct stream *s, struct filter *f, struct http_msg *msg); // DEPRECATED
+	int  (*http_chunk_trailers)(struct stream *s, struct filter *f, struct http_msg *msg); // DEPRECATED
+	int  (*http_forward_data)  (struct stream *s, struct filter *f, struct http_msg *msg,  // DEPRECATED
 				    unsigned int len);
 
 	void (*http_reset)         (struct stream *s, struct filter *f, struct http_msg *msg);
 	void (*http_reply)         (struct stream *s, struct filter *f, short status,
-				    const struct chunk *msg);
+				    const struct buffer *msg);
 
 	/*
 	 * TCP callbacks
@@ -199,11 +206,13 @@ struct flt_ops {
 				 unsigned int len);
 };
 
+/* Flags set on a filter config */
+#define FLT_CFG_FL_HTX    0x00000001  /* The filter can filter HTX streams */
+
 /* Flags set on a filter instance */
 #define FLT_FL_IS_BACKEND_FILTER  0x0001 /* The filter is a backend filter */
 #define FLT_FL_IS_REQ_DATA_FILTER 0x0002 /* The filter will parse data on the request channel */
 #define FLT_FL_IS_RSP_DATA_FILTER 0x0004 /* The filter will parse data on the response channel */
-
 
 /* Flags set on the stream, common to all filters attached to its stream */
 #define STRM_FLT_FL_HAS_FILTERS          0x0001 /* The stream has at least one filter */
@@ -217,6 +226,7 @@ struct flt_conf {
 	struct flt_ops *ops;  /* The filter callbacks */
 	void           *conf; /* The filter configuration */
 	struct list     list; /* Next filter for the same proxy */
+	unsigned int    flags; /* FLT_CFG_FL_* */
 };
 
 /*
@@ -236,6 +246,7 @@ struct filter {
 	                                    * 0: request channel, 1: response channel */
 	unsigned int    fwd[2];            /* Offset, relative to buf->p, to the next byte to forward for a specific channel
 	                                    * 0: request channel, 1: response channel */
+	unsigned long long offset[2];
 	unsigned int    pre_analyzers;     /* bit field indicating analyzers to pre-process */
 	unsigned int    post_analyzers;    /* bit field indicating analyzers to post-process */
 	struct list     list;              /* Next filter for the same proxy/stream */
@@ -251,8 +262,9 @@ struct strm_flt {
 	                                       * If NULL, we start from the first filter.
 	                                       * 0: request channel, 1: response channel */
 	unsigned short flags;                 /* STRM_FL_* */
-	unsigned char  nb_req_data_filters;   /* Number of data filters registerd on the request channel */
-	unsigned char  nb_rsp_data_filters;   /* Number of data filters registerd on the response channel */
+	unsigned char  nb_req_data_filters;   /* Number of data filters registered on the request channel */
+	unsigned char  nb_rsp_data_filters;   /* Number of data filters registered on the response channel */
+	unsigned long long offset[2];
 };
 
 #endif /* _TYPES_FILTERS_H */

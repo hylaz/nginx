@@ -1807,7 +1807,9 @@ ngx_escape_html(u_char *dst, u_char *src, size_t size)
     return (uintptr_t) dst;
 }
 
-
+/**
+ * 转换成json
+ */ 
 uintptr_t
 ngx_escape_json(u_char *dst, u_char *src, size_t size)
 {

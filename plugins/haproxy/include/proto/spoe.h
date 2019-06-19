@@ -61,7 +61,7 @@ spoe_encode_buffer(const char *str, size_t len, char **buf, char *end)
 /* Encode a buffer, possibly partially. It does the same thing than
  * 'spoe_encode_buffer', but if there is not enough space, it does not fail.
  * On success, it returns the number of copied bytes and <*buf> is moved after
- * the encoded value. If an error occured, it returns -1. */
+ * the encoded value. If an error occurred, it returns -1. */
 static inline int
 spoe_encode_frag_buffer(const char *str, size_t len, char **buf, char *end)
 {
@@ -113,15 +113,13 @@ spoe_decode_buffer(char **buf, char *end, char **str, uint64_t *len)
 
 /* Encode a typed data using value in <smp>. On success, it returns the number
  * of copied bytes and <*buf> is moved after the encoded value. If an error
- * occured, it returns -1.
+ * occurred, it returns -1.
  *
  * If the value is too big to be encoded, depending on its type, then encoding
  * failed or the value is partially encoded. Only strings and binaries can be
- * partially encoded. In this case, the offset <*off> is updated to known how
- * many bytes has been encoded. If <*off> is zero at the end, it means that all
- * data has been encoded. */
+ * partially encoded. */
 static inline int
-spoe_encode_data(struct sample *smp, unsigned int *off, char **buf, char *end)
+spoe_encode_data(struct sample *smp, char **buf, char *end)
 {
 	char *p = *buf;
 	int   ret;
@@ -164,34 +162,41 @@ spoe_encode_data(struct sample *smp, unsigned int *off, char **buf, char *end)
 
 		case SMP_T_STR:
 		case SMP_T_BIN: {
-			struct chunk *chk = &smp->data.u.str;
+			/* If defined, get length and offset of the sample by reading the sample
+			 * context. ctx.a[0] is the pointer to the length and ctx.a[1] is the
+			 * pointer to the offset. If the offset is greater than 0, it means the
+			 * sample is partially encoded. In this case, we only need to encode the
+			 * reamining. When all the sample is encoded, the offset is reset to 0.
+			 * So the caller know it can try to encode the next sample. */
+			struct buffer *chk = &smp->data.u.str;
+			unsigned int *len  = smp->ctx.a[0];
+			unsigned int *off  = smp->ctx.a[1];
 
-			/* Here, we need to know if the sample has already been
-			 * partially encoded. If yes, we only need to encode the
-			 * remaining, <*off> reprensenting the number of bytes
-			 * already encoded. */
 			if (!*off) {
 				/* First evaluation of the sample : encode the
 				 * type (string or binary), the buffer length
 				 * (as a varint) and at least 1 byte of the
 				 * buffer. */
-				struct chunk *chk = &smp->data.u.str;
+				struct buffer *chk = &smp->data.u.str;
 
 				*p++ = (smp->data.type == SMP_T_STR)
 					? SPOE_DATA_T_STR
 					: SPOE_DATA_T_BIN;
-				ret = spoe_encode_frag_buffer(chk->str, chk->len, &p, end);
+				ret = spoe_encode_frag_buffer(chk->area,
+							      chk->data, &p,
+							      end);
 				if (ret == -1)
 					return -1;
+				*len = chk->data;
 			}
 			else {
 				/* The sample has been fragmented, encode remaining data */
-				ret = MIN(chk->len - *off, end - p);
-				memcpy(p, chk->str + *off, ret);
+				ret = MIN(*len - *off, end - p);
+				memcpy(p, chk->area + *off, ret);
 				p += ret;
 			}
 			/* Now update <*off> */
-			if (ret + *off != chk->len)
+			if (ret + *off != *len)
 				*off += ret;
 			else
 				*off = 0;
@@ -214,8 +219,8 @@ spoe_encode_data(struct sample *smp, unsigned int *off, char **buf, char *end)
 				case HTTP_METH_CONNECT: m = "CONNECT"; len = 7; break;
 
 				default :
-					m   = smp->data.u.meth.str.str;
-					len = smp->data.u.meth.str.len;
+					m   = smp->data.u.meth.str.area;
+					len = smp->data.u.meth.str.data;
 			}
 			if (spoe_encode_buffer(m, len, &p, end) == -1)
 				return -1;
@@ -333,8 +338,8 @@ spoe_decode_data(char **buf, char *end, struct sample *smp)
 			/* All the buffer must be decoded */
 			if (spoe_decode_buffer(&p, end, &str, &sz) == -1)
 				return -1;
-			smp->data.u.str.str = str;
-			smp->data.u.str.len = sz;
+			smp->data.u.str.area = str;
+			smp->data.u.str.data = sz;
 			smp->data.type = (type == SPOE_DATA_T_STR) ? SMP_T_STR : SMP_T_BIN;
 			break;
 	}

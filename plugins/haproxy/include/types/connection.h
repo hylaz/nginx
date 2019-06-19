@@ -40,10 +40,34 @@
 /* referenced below */
 struct connection;
 struct conn_stream;
+struct cs_info;
 struct buffer;
+struct proxy;
 struct server;
+struct session;
 struct pipe;
 
+/* socks4 upstream proxy definitions */
+struct socks4_request {
+	uint8_t version;	/* SOCKS version number, 1 byte, must be 0x04 for this version */
+	uint8_t command;	/* 0x01 = establish a TCP/IP stream connection */
+	uint16_t port;		/* port number, 2 bytes (in network byte order) */
+	uint32_t ip;		/* IP address, 4 bytes (in network byte order) */
+	char user_id[8];	/* the user ID string, variable length, terminated with a null (0x00); Using "HAProxy\0" */
+};
+
+/* Note: subscribing to these events is only valid after the caller has really
+ * attempted to perform the operation, and failed to proceed or complete.
+ */
+enum sub_event_type {
+	SUB_RETRY_RECV       = 0x00000001,  /* Schedule the tasklet when we can attempt to recv again */
+	SUB_RETRY_SEND       = 0x00000002,  /* Schedule the tasklet when we can attempt to send again */
+};
+
+struct wait_event {
+	struct tasklet *tasklet;
+	int events;             /* set of enum sub_event_type above */
+};
 
 /* A connection handle is how we differentiate two connections on the lower
  * layers. It usually is a file descriptor but can be a connection id.
@@ -55,9 +79,6 @@ union conn_handle {
 /* conn_stream flags */
 enum {
 	CS_FL_NONE          = 0x00000000,  /* Just for initialization purposes */
-	CS_FL_DATA_RD_ENA   = 0x00000001,  /* receiving data is allowed */
-	CS_FL_DATA_WR_ENA   = 0x00000002,  /* sending data is desired */
-
 	CS_FL_SHRD          = 0x00000010,  /* read shut, draining extra data */
 	CS_FL_SHRR          = 0x00000020,  /* read shut, resetting extra data */
 	CS_FL_SHR           = CS_FL_SHRD | CS_FL_SHRR, /* read shut status */
@@ -68,9 +89,21 @@ enum {
 
 
 	CS_FL_ERROR         = 0x00000100,  /* a fatal error was reported */
-	CS_FL_RCV_MORE      = 0x00000200,  /* more bytes to receive but not enough room */
-	CS_FL_EOS           = 0x00001000,  /* End of stream */
-	CS_FL_KILL_CONN     = 0x00002000,  /* must kill the connection when the CS closes */
+	CS_FL_RCV_MORE      = 0x00000200,  /* We may have more bytes to transfert */
+	CS_FL_WANT_ROOM     = 0x00000400,  /* More bytes to transfert, but not enough room */
+	CS_FL_ERR_PENDING   = 0x00000800,  /* An error is pending, but there's still data to be read */
+	CS_FL_EOS           = 0x00001000,  /* End of stream delivered to data layer */
+	/* unused: 0x00002000 */
+	CS_FL_EOI           = 0x00004000,  /* end-of-input reached */
+	/* unused: 0x00008000 */
+	CS_FL_WAIT_FOR_HS   = 0x00010000,  /* This stream is waiting for handhskae */
+	CS_FL_KILL_CONN     = 0x00020000,  /* must kill the connection when the CS closes */
+
+	/* following flags are supposed to be set by the mux and read/unset by
+	 * the stream-interface :
+	 */
+	CS_FL_NOT_FIRST     = 0x00100000,  /* this stream is not the first one */
+	CS_FL_READ_PARTIAL  = 0x00200000,  /* some data were received (not necessarily xferred) */
 };
 
 /* cs_shutr() modes */
@@ -103,12 +136,12 @@ enum {
 	CO_FL_NONE          = 0x00000000,  /* Just for initialization purposes */
 
 	/* Do not change these values without updating conn_*_poll_changes() ! */
-	CO_FL_SOCK_RD_ENA   = 0x00000001,  /* receiving handshakes is allowed */
+	/* unusued : 0x00000001 */
 	CO_FL_XPRT_RD_ENA   = 0x00000002,  /* receiving data is allowed */
 	CO_FL_CURR_RD_ENA   = 0x00000004,  /* receiving is currently allowed */
 	/* unused : 0x00000008 */
 
-	CO_FL_SOCK_WR_ENA   = 0x00000010,  /* sending handshakes is desired */
+	/* unused : 0x00000010 */
 	CO_FL_XPRT_WR_ENA   = 0x00000020,  /* sending data is desired */
 	CO_FL_CURR_WR_ENA   = 0x00000040,  /* sending is currently desired */
 	/* unused : 0x00000080 */
@@ -131,8 +164,8 @@ enum {
 
 	CO_FL_EARLY_SSL_HS  = 0x00004000,  /* We have early data pending, don't start SSL handshake yet */
 	CO_FL_EARLY_DATA    = 0x00008000,  /* At least some of the data are early data */
-	/* unused : 0x00010000 */
-	/* unused : 0x00020000 */
+	CO_FL_SOCKS4_SEND   = 0x00010000,  /* handshaking with upstream SOCKS4 proxy, going to send the handshake */
+	CO_FL_SOCKS4_RECV   = 0x00020000,  /* handshaking with upstream SOCKS4 proxy, going to check if handshake succeed */
 
 	/* flags used to remember what shutdown have been performed/reported */
 	CO_FL_SOCK_RD_SH    = 0x00040000,  /* SOCK layer was notified about shutr/read0 */
@@ -158,14 +191,8 @@ enum {
 	CO_FL_ACCEPT_CIP    = 0x08000000,  /* receive a valid NetScaler Client IP header */
 
 	/* below we have all handshake flags grouped into one */
-	CO_FL_HANDSHAKE     = CO_FL_SEND_PROXY | CO_FL_SSL_WAIT_HS | CO_FL_ACCEPT_PROXY | CO_FL_ACCEPT_CIP,
-
-	/* when any of these flags is set, polling is defined by socket-layer
-	 * operations, as opposed to data-layer. Transport is explicitly not
-	 * mentionned here to avoid any confusion, since it can be the same
-	 * as DATA or SOCK on some implementations.
-	 */
-	CO_FL_POLL_SOCK     = CO_FL_HANDSHAKE | CO_FL_WAIT_L4_CONN | CO_FL_WAIT_L6_CONN,
+	CO_FL_HANDSHAKE     = CO_FL_SEND_PROXY | CO_FL_SSL_WAIT_HS | CO_FL_ACCEPT_PROXY | CO_FL_ACCEPT_CIP | CO_FL_SOCKS4_SEND | CO_FL_SOCKS4_RECV,
+	CO_FL_HANDSHAKE_NOSSL = CO_FL_SEND_PROXY | CO_FL_ACCEPT_PROXY | CO_FL_ACCEPT_CIP | CO_FL_SOCKS4_SEND | CO_FL_SOCKS4_RECV,
 
 	/* This connection may not be shared between clients */
 	CO_FL_PRIVATE       = 0x10000000,
@@ -173,15 +200,18 @@ enum {
 	/* This flag is used to know that a PROXY protocol header was sent by the client */
 	CO_FL_RCVD_PROXY    = 0x20000000,
 
-	/* unused : 0x40000000 */
+	/* The connection is unused by its owner */
+	CO_FL_SESS_IDLE     = 0x40000000,
 
 	/* This last flag indicates that the transport layer is used (for instance
 	 * by logs) and must not be cleared yet. The last call to conn_xprt_close()
 	 * must be done after clearing this flag.
 	 */
 	CO_FL_XPRT_TRACKED  = 0x80000000,
-};
 
+	/* below we have all SOCKS handshake flags grouped into one */
+	CO_FL_SOCKS4        = CO_FL_SOCKS4_SEND | CO_FL_SOCKS4_RECV,
+};
 
 /* possible connection error codes */
 enum {
@@ -229,6 +259,11 @@ enum {
 	CO_ER_SSL_KILLED_HB,    /* Stopped a TLSv1 heartbeat attack (CVE-2014-0160) */
 	CO_ER_SSL_NO_TARGET,    /* unknown target (not client nor server) */
 	CO_ER_SSL_EARLY_FAILED, /* Server refused early data */
+
+	CO_ER_SOCKS4_SEND,       /* SOCKS4 Proxy write error during handshake */
+	CO_ER_SOCKS4_RECV,       /* SOCKS4 Proxy read error during handshake */
+	CO_ER_SOCKS4_DENY,       /* SOCKS4 Proxy deny the request */
+	CO_ER_SOCKS4_ABORT,      /* SOCKS4 Proxy handshake aborted by server */
 };
 
 /* source address settings for outgoing connections */
@@ -243,7 +278,13 @@ enum {
 	CO_SRC_BIND        = 0x0008,    /* bind to a specific source address when connecting */
 };
 
-/* flags that can be passed to xprt->snd_buf() */
+/* flags that can be passed to xprt->rcv_buf() and mux->rcv_buf() */
+enum {
+	CO_RFL_BUF_WET     = 0x0001,    /* Buffer still has some output data present */
+	CO_RFL_BUF_FLUSH   = 0x0002,    /* Flush mux's buffers but don't read more data */
+};
+
+/* flags that can be passed to xprt->snd_buf() and mux->snd_buf() */
 enum {
 	CO_SFL_MSG_MORE    = 0x0001,    /* More data to come afterwards */
 	CO_SFL_STREAMER    = 0x0002,    /* Producer is continuously streaming data */
@@ -253,6 +294,7 @@ enum {
 enum {
 	XPRT_RAW = 0,
 	XPRT_SSL = 1,
+	XPRT_HANDSHAKE = 2,
 	XPRT_ENTRIES /* must be last one */
 };
 
@@ -260,6 +302,7 @@ enum {
 enum {
 	MX_FL_NONE        = 0x00000000,
 	MX_FL_CLEAN_ABRT  = 0x00000001, /* abort is clearly reported as an error */
+	MX_FL_HTX         = 0x00000002, /* set if it is an HTX multiplexer */
 };
 
 /* xprt_ops describes transport-layer operations for a connection. They
@@ -268,20 +311,24 @@ enum {
  * and the other ones are used to setup and release the transport layer.
  */
 struct xprt_ops {
-	int  (*rcv_buf)(struct connection *conn, struct buffer *buf, int count); /* recv callback */
-	int  (*snd_buf)(struct connection *conn, struct buffer *buf, int flags); /* send callback */
-	int  (*rcv_pipe)(struct connection *conn, struct pipe *pipe, unsigned int count); /* recv-to-pipe callback */
-	int  (*snd_pipe)(struct connection *conn, struct pipe *pipe); /* send-to-pipe callback */
-	void (*shutr)(struct connection *, int);    /* shutr function */
-	void (*shutw)(struct connection *, int);    /* shutw function */
-	void (*close)(struct connection *);         /* close the transport layer */
-	int  (*init)(struct connection *conn);      /* initialize the transport layer */
+	size_t (*rcv_buf)(struct connection *conn, void *xprt_ctx, struct buffer *buf, size_t count, int flags); /* recv callback */
+	size_t (*snd_buf)(struct connection *conn, void *xprt_ctx, const struct buffer *buf, size_t count, int flags); /* send callback */
+	int  (*rcv_pipe)(struct connection *conn, void *xprt_ctx, struct pipe *pipe, unsigned int count); /* recv-to-pipe callback */
+	int  (*snd_pipe)(struct connection *conn, void *xprt_ctx, struct pipe *pipe); /* send-to-pipe callback */
+	void (*shutr)(struct connection *conn, void *xprt_ctx, int);    /* shutr function */
+	void (*shutw)(struct connection *conn, void *xprt_ctx, int);    /* shutw function */
+	void (*close)(struct connection *conn, void *xprt_ctx);         /* close the transport layer */
+	int  (*init)(struct connection *conn, void **ctx);      /* initialize the transport layer */
 	int  (*prepare_bind_conf)(struct bind_conf *conf); /* prepare a whole bind_conf */
 	void (*destroy_bind_conf)(struct bind_conf *conf); /* destroy a whole bind_conf */
 	int  (*prepare_srv)(struct server *srv);    /* prepare a server context */
 	void (*destroy_srv)(struct server *srv);    /* destroy a server context */
-	int  (*get_alpn)(const struct connection *conn, const char **str, int *len); /* get application layer name */
+	int  (*get_alpn)(const struct connection *conn, void *xprt_ctx, const char **str, int *len); /* get application layer name */
 	char name[8];                               /* transport layer name, zero-terminated */
+	int (*subscribe)(struct connection *conn, void *xprt_ctx, int event_type, void *param); /* Subscribe to events, such as "being able to send" */
+	int (*unsubscribe)(struct connection *conn, void *xprt_ctx, int event_type, void *param); /* Unsubscribe to events */
+	int (*remove_xprt)(struct connection *conn, void *xprt_ctx, void *toremove_ctx, const struct xprt_ops *newops, void *newctx); /* Remove an xprt from the connection, used by temporary xprt such as the handshake one */
+	int (*add_xprt)(struct connection *conn, void *xprt_ctx, void *toadd_ctx, const struct xprt_ops *toadd_ops, void **oldxprt_ctx, const struct xprt_ops **oldxprt_ops); /* Add a new XPRT as the new xprt, and return the old one */
 };
 
 /* mux_ops describes the mux operations, which are to be performed at the
@@ -292,21 +339,26 @@ struct xprt_ops {
  * layer is not ready yet.
  */
 struct mux_ops {
-	int  (*init)(struct connection *conn);        /* early initialization */
-	void (*recv)(struct connection *conn);        /* mux-layer recv callback */
-	void (*send)(struct connection *conn);        /* mux-layer send callback */
+	int  (*init)(struct connection *conn, struct proxy *prx, struct session *sess, struct buffer *input);  /* early initialization */
 	int  (*wake)(struct connection *conn);        /* mux-layer callback to report activity, mandatory */
-	void (*update_poll)(struct conn_stream *cs);  /* commit cs flags to mux/conn */
-	int  (*rcv_buf)(struct conn_stream *cs, struct buffer *buf, int count); /* Called from the upper layer to get data */
-	int  (*snd_buf)(struct conn_stream *cs, struct buffer *buf, int flags); /* Called from the upper layer to send data */
+	size_t (*rcv_buf)(struct conn_stream *cs, struct buffer *buf, size_t count, int flags); /* Called from the upper layer to get data */
+	size_t (*snd_buf)(struct conn_stream *cs, struct buffer *buf, size_t count, int flags); /* Called from the upper layer to send data */
 	int  (*rcv_pipe)(struct conn_stream *cs, struct pipe *pipe, unsigned int count); /* recv-to-pipe callback */
 	int  (*snd_pipe)(struct conn_stream *cs, struct pipe *pipe); /* send-to-pipe callback */
 	void (*shutr)(struct conn_stream *cs, enum cs_shr_mode);     /* shutr function */
 	void (*shutw)(struct conn_stream *cs, enum cs_shw_mode);     /* shutw function */
 
-	struct conn_stream *(*attach)(struct connection *); /* Create and attach a conn_stream to an outgoing connection */
+	struct conn_stream *(*attach)(struct connection *, struct session *sess); /* Create and attach a conn_stream to an outgoing connection */
+	const struct conn_stream *(*get_first_cs)(const struct connection *); /* retrieves any valid conn_stream from this connection */
 	void (*detach)(struct conn_stream *); /* Detach a conn_stream from an outgoing connection, when the request is done */
-	void (*show_fd)(struct chunk *, struct connection *); /* append some data about connection into chunk for "show fd" */
+	void (*show_fd)(struct buffer *, struct connection *); /* append some data about connection into chunk for "show fd" */
+	int (*subscribe)(struct conn_stream *cs, int event_type, void *param); /* Subscribe to events, such as "being able to send" */
+	int (*unsubscribe)(struct conn_stream *cs, int event_type, void *param); /* Unsubscribe to events */
+	int (*avail_streams)(struct connection *conn); /* Returns the number of streams still available for a connection */
+	int (*used_streams)(struct connection *conn);  /* Returns the number of streams in use on a connection. */
+	void (*destroy)(void *ctx); /* Let the mux know one of its users left, so it may have to disappear */
+	void (*reset)(struct connection *conn); /* Reset the mux, because we're re-trying to connect */
+	const struct cs_info *(*get_cs_info)(struct conn_stream *cs); /* Return info on the specified conn_stream or NULL if not defined */
 	unsigned int flags;                           /* some flags characterizing the mux's capabilities (MX_FL_*) */
 	char name[8];                                 /* mux layer name, zero-terminated */
 };
@@ -319,8 +371,6 @@ struct mux_ops {
  * data movement. It may abort a connection by returning < 0.
  */
 struct data_cb {
-	void (*recv)(struct conn_stream *cs);  /* data-layer recv callback */
-	void (*send)(struct conn_stream *cs);  /* data-layer send callback */
 	int  (*wake)(struct conn_stream *cs);  /* data-layer callback to report activity */
 	char name[8];                           /* data layer name, zero-terminated */
 };
@@ -353,11 +403,25 @@ struct conn_src {
  */
 struct conn_stream {
 	enum obj_type obj_type;              /* differentiates connection from applet context */
+	/* 3 bytes hole here */
+	unsigned int flags;                  /* CS_FL_* */
 	struct connection *conn;             /* xprt-level connection */
-	unsigned int flags;                    /* CS_FL_* */
 	void *data;                          /* pointer to upper layer's entity (eg: stream interface) */
 	const struct data_cb *data_cb;       /* data layer callbacks. Must be set before xprt->init() */
 	void *ctx;                           /* mux-specific context */
+};
+
+/*
+ * This structure describes the info related to a conn_stream known by the mux
+ * only but usefull for the upper layer.
+ * For now, only some dates and durations are reported. This structure will
+ * envolved. But for now, only the bare minimum is referenced.
+ */
+struct cs_info {
+	struct timeval create_date;  /* Creation date of the conn_stream in user date */
+	struct timeval tv_create;    /* Creation date of the conn_stream in internal date (monotonic) */
+	long t_handshake;            /* hanshake duration, -1 if never occurs */
+	long t_idle;                 /* idle duration, -1 if never occurs */
 };
 
 /* This structure describes a connection with its methods and data.
@@ -371,42 +435,57 @@ struct conn_stream {
  * connection being instanciated. It must be removed once done.
  */
 struct connection {
+	/* first cache line */
 	enum obj_type obj_type;       /* differentiates connection from applet context */
 	unsigned char err_code;       /* CO_ER_* */
-	signed short send_proxy_ofs;  /* <0 = offset to (re)send from the end, >0 = send all */
+	signed short send_proxy_ofs;  /* <0 = offset to (re)send from the end, >0 = send all (reused for SOCKS4) */
 	unsigned int flags;           /* CO_FL_* */
 	const struct protocol *ctrl;  /* operations at the socket layer */
 	const struct xprt_ops *xprt;  /* operations at the transport layer */
 	const struct mux_ops  *mux;   /* mux layer opreations. Must be set before xprt->init() */
 	void *xprt_ctx;               /* general purpose pointer, initialized to NULL */
-	void *mux_ctx;                /* mux-specific context, initialized to NULL */
-	void *owner;                  /* pointer to the owner session for incoming connections, or NULL */
-	int xprt_st;                  /* transport layer state, initialized to zero */
-	int tmp_early_data;           /* 1st byte of early data, if any */
-	int sent_early_data;          /* Amount of early data we sent so far */
-	union conn_handle handle;     /* connection handle at the socket layer */
+	void *ctx;                    /* highest level context (usually the mux), initialized to NULL */
+	void *owner;                  /* pointer to the owner session, or NULL */
 	enum obj_type *target;        /* the target to connect to (server, proxy, applet, ...) */
+
+	/* second cache line */
+	struct wait_event *send_wait; /* Task to wake when we're ready to send */
+	struct wait_event *recv_wait; /* Task to wake when we're ready to recv */
 	struct list list;             /* attach point to various connection lists (idle, ...) */
-	int (*xprt_done_cb)(struct connection *conn);  /* callback to notify of end of handshake */
-	void (*destroy_cb)(struct connection *conn);  /* callback to notify of imminent death of the connection */
+	struct list session_list;     /* List of attached connections to a session */
+	union conn_handle handle;     /* connection handle at the socket layer */
 	const struct netns_entry *proxy_netns;
+	int (*xprt_done_cb)(struct connection *conn);  /* callback to notify of end of handshake */
+
+	/* third cache line and beyond */
+	void (*destroy_cb)(struct connection *conn);  /* callback to notify of imminent death of the connection */
 	struct {
 		struct sockaddr_storage from;	/* client address, or address to spoof when connecting to the server */
 		struct sockaddr_storage to;	/* address reached by the client, or address to connect to */
 	} addr; /* addresses of the remote side, client for producer and server for consumer */
+	unsigned int idle_time;                 /* Time the connection was added to the idle list, or 0 if not in the idle list */
 };
 
-/* ALPN token registration */
-enum alpn_proxy_mode {
-	ALPN_MODE_NONE = 0,
-	ALPN_MODE_TCP  = 1 << 0, // must not be changed!
-	ALPN_MODE_HTTP = 1 << 1, // must not be changed!
-	ALPN_MODE_ANY  = ALPN_MODE_TCP | ALPN_MODE_HTTP,
+/* PROTO token registration */
+enum proto_proxy_mode {
+	PROTO_MODE_NONE = 0,
+	PROTO_MODE_TCP  = 1 << 0, // must not be changed!
+	PROTO_MODE_HTTP = 1 << 1, // must not be changed!
+	PROTO_MODE_HTX  = 1 << 2, // must not be changed!
+	PROTO_MODE_ANY  = PROTO_MODE_TCP | PROTO_MODE_HTTP, // note: HTX is experimental and must not appear here
 };
 
-struct alpn_mux_list {
+enum proto_proxy_side {
+	PROTO_SIDE_NONE = 0,
+	PROTO_SIDE_FE   = 1, // same as PR_CAP_FE
+	PROTO_SIDE_BE   = 2, // same as PR_CAP_BE
+	PROTO_SIDE_BOTH = PROTO_SIDE_FE | PROTO_SIDE_BE,
+};
+
+struct mux_proto_list {
 	const struct ist token;    /* token name and length. Empty is catch-all */
-	enum alpn_proxy_mode mode;
+	enum proto_proxy_mode mode;
+	enum proto_proxy_side side;
 	const struct mux_ops *mux;
 	struct list list;
 };
@@ -509,6 +588,8 @@ struct tlv_ssl {
  */
 /* Max number of file descriptors we send in one sendmsg() */
 #define MAX_SEND_FD 253
+
+#define SOCKS4_HS_RSP_LEN 8
 
 #endif /* _TYPES_CONNECTION_H */
 

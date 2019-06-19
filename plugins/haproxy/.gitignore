@@ -5,8 +5,10 @@
 !/.gitignore
 !/CHANGELOG
 !/LICENSE
+!/BRANCHES
 !/Makefile
 !/README
+!/INSTALL
 !/CONTRIBUTING
 !/MAINTAINERS
 !/ROADMAP
@@ -22,6 +24,7 @@
 !/tests
 !/debian
 !/scripts
+!/reg-tests
 # Reject some generic files
 *.o
 *~

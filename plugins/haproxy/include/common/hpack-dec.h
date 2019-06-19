@@ -28,12 +28,13 @@
 #ifndef _COMMON_HPACK_DEC_H
 #define _COMMON_HPACK_DEC_H
 
-#include <stdint.h>
+#include <inttypes.h>
 #include <common/chunk.h>
 #include <common/config.h>
 #include <common/hpack-tbl.h>
 
 int hpack_decode_frame(struct hpack_dht *dht, const uint8_t *raw, uint32_t len,
-                       struct http_hdr *list, int list_size, struct chunk *tmp);
+                       struct http_hdr *list, int list_size,
+                       struct buffer *tmp);
 
 #endif /* _COMMON_HPACK_DEC_H */

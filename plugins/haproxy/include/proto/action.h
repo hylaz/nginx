@@ -24,6 +24,9 @@
 
 #include <types/action.h>
 
+int act_resolution_cb(struct dns_requester *requester, struct dns_nameserver *nameserver);
+int act_resolution_error_cb(struct dns_requester *requester, int error_code);
+
 static inline struct action_kw *action_lookup(struct list *keywords, const char *kw)
 {
 	struct action_kw_list *kw_list;
@@ -44,7 +47,8 @@ static inline struct action_kw *action_lookup(struct list *keywords, const char 
 	return NULL;
 }
 
-static inline void action_build_list(struct list *keywords, struct chunk *chk)
+static inline void action_build_list(struct list *keywords,
+				     struct buffer *chk)
 {
 	struct action_kw_list *kw_list;
 	int i;
@@ -52,7 +56,7 @@ static inline void action_build_list(struct list *keywords, struct chunk *chk)
 	char *end;
 	int l;
 
-	p = chk->str;
+	p = chk->area;
 	end = p + chk->size - 1;
 	list_for_each_entry(kw_list, keywords, list) {
 		for (i = 0; kw_list->kw[i].kw != NULL; i++) {
@@ -62,7 +66,7 @@ static inline void action_build_list(struct list *keywords, struct chunk *chk)
 			p += l;
 		}
 	}
-	if (p > chk->str)
+	if (p > chk->area)
 		*(p-2) = '\0';
 	else
 		*p = '\0';

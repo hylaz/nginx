@@ -35,6 +35,7 @@ const char *arg_type_names[ARGT_NBTYPES] = {
 	[ARGT_MAP]  = "map",
 	[ARGT_REG]  = "regex",
 	[ARGT_VAR]  = "variable",
+	[ARGT_PBUF_FNUM] = "Protocol buffers field number",
 	/* Unassigned types must never happen. Better crash during parsing if they do. */
 };
 
@@ -174,9 +175,9 @@ int make_arg_list(const char *in, int len, uint64_t mask, struct arg **argp,
 			 * during the parsing. The caller must at one point resolve
 			 * them and free the string.
 			 */
-			arg->data.str.str = word;
-			arg->data.str.len = in - beg;
-			arg->data.str.size = arg->data.str.len + 1;
+			arg->data.str.area = word;
+			arg->data.str.data = in - beg;
+			arg->data.str.size = arg->data.str.data + 1;
 			word = NULL;
 			break;
 
@@ -206,16 +207,26 @@ int make_arg_list(const char *in, int len, uint64_t mask, struct arg **argp,
 				goto parse_err;
 			break;
 
-		case ARGT_MSK6: /* not yet implemented */
-			goto not_impl;
+		case ARGT_MSK6:
+			if (in == beg)    // empty mask
+				goto empty_err;
+
+			if (!str2mask6(word, &arg->data.ipv6))
+				goto parse_err;
+
+			arg->type = ARGT_IPV6;
+			break;
 
 		case ARGT_TIME:
 			if (in == beg)    // empty time
 				goto empty_err;
 
 			ptr_err = parse_time_err(word, &uint, TIME_UNIT_MS);
-			if (ptr_err)
+			if (ptr_err) {
+				if (ptr_err == PARSE_TIME_OVER || ptr_err == PARSE_TIME_UNDER)
+					ptr_err = word;
 				goto parse_err;
+			}
 			arg->data.sint = uint;
 			arg->type = ARGT_SINT;
 			break;
@@ -230,6 +241,15 @@ int make_arg_list(const char *in, int len, uint64_t mask, struct arg **argp,
 
 			arg->data.sint = uint;
 			arg->type = ARGT_SINT;
+			break;
+
+		case ARGT_PBUF_FNUM:
+			if (in == beg)
+				goto empty_err;
+
+			if (!parse_dotted_uints(word, &arg->data.fid.ids, &arg->data.fid.sz))
+				goto parse_err;
+
 			break;
 
 			/* FIXME: other types need to be implemented here */

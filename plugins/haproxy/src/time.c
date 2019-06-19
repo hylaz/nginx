@@ -10,6 +10,8 @@
  *
  */
 
+#include <inttypes.h>
+#include <unistd.h>
 #include <sys/time.h>
 
 #include <common/config.h>
@@ -21,7 +23,6 @@ THREAD_LOCAL unsigned int   ms_left_scaled;  /* milliseconds left for current se
 THREAD_LOCAL unsigned int   now_ms;          /* internal date in milliseconds (may wrap) */
 THREAD_LOCAL unsigned int   samp_time;       /* total elapsed time over current sample */
 THREAD_LOCAL unsigned int   idle_time;       /* total idle time over current sample */
-THREAD_LOCAL unsigned int   idle_pct;        /* idle to total ratio over last sample (percent) */
 THREAD_LOCAL struct timeval now;             /* internal date is a monotonic function of real clock */
 THREAD_LOCAL struct timeval date;            /* the real current date */
 struct timeval start_date;      /* the process's start date */
@@ -29,7 +30,7 @@ THREAD_LOCAL struct timeval before_poll;     /* system date before calling poll(
 THREAD_LOCAL struct timeval after_poll;      /* system date after leaving poll() */
 
 static THREAD_LOCAL struct timeval tv_offset;  /* per-thread time ofsset relative to global time */
-volatile unsigned long long global_now;        /* common date between all threads (32:32) */
+static volatile unsigned long long global_now; /* common date between all threads (32:32) */
 
 /*
  * adds <ms> ms to <from>, set the result to <tv> and returns a pointer <tv>
@@ -184,9 +185,12 @@ REGPRM2 void tv_update_date(int max_wait, int interrupted)
 		adjusted = date;
 		after_poll = date;
 		samp_time = idle_time = 0;
-		idle_pct = 100;
-		global_now = (((unsigned long long)adjusted.tv_sec) << 32) +
-		             (unsigned int)adjusted.tv_usec;
+		ti->idle_pct = 100;
+		old_now = global_now;
+		if (!old_now) { // never set
+			new_now = (((unsigned long long)adjusted.tv_sec) << 32) + (unsigned int)adjusted.tv_usec;
+			_HA_ATOMIC_CAS(&global_now, &old_now, new_now);
+		}
 		goto to_ms;
 	}
 
@@ -226,7 +230,7 @@ REGPRM2 void tv_update_date(int max_wait, int interrupted)
 		new_now = (((unsigned long long)tmp_adj.tv_sec) << 32) + (unsigned int)tmp_adj.tv_usec;
 
 		/* let's try to update the global <now> or loop again */
-	} while (!HA_ATOMIC_CAS(&global_now, &old_now, new_now));
+	} while (!_HA_ATOMIC_CAS(&global_now, &old_now, new_now));
 
 	adjusted = tmp_adj;
 

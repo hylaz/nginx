@@ -71,8 +71,8 @@ void show_chn_flags(unsigned int f)
 	}
 
 	SHOW_FLAG(f, CF_ISRESP);
+	SHOW_FLAG(f, CF_EOI);
 	SHOW_FLAG(f, CF_FLT_ANALYZE);
-	SHOW_FLAG(f, CF_WRITE_EVENT);
 	SHOW_FLAG(f, CF_WAKE_ONCE);
 	SHOW_FLAG(f, CF_NEVER_WAIT);
 	SHOW_FLAG(f, CF_SEND_DONTWAIT);
@@ -130,6 +130,8 @@ void show_conn_flags(unsigned int f)
 	SHOW_FLAG(f, CO_FL_ERROR);
 	SHOW_FLAG(f, CO_FL_SOCK_WR_SH);
 	SHOW_FLAG(f, CO_FL_SOCK_RD_SH);
+	SHOW_FLAG(f, CO_FL_SOCKS4_RECV);
+	SHOW_FLAG(f, CO_FL_SOCKS4_SEND);
 	SHOW_FLAG(f, CO_FL_EARLY_DATA);
 	SHOW_FLAG(f, CO_FL_EARLY_SSL_HS);
 	SHOW_FLAG(f, CO_FL_ADDR_TO_SET);
@@ -157,15 +159,20 @@ void show_cs_flags(unsigned int f)
 		printf("0\n");
 		return;
 	}
+	SHOW_FLAG(f, CS_FL_READ_PARTIAL);
+	SHOW_FLAG(f, CS_FL_NOT_FIRST);
+	SHOW_FLAG(f, CS_FL_KILL_CONN);
+	SHOW_FLAG(f, CS_FL_WAIT_FOR_HS);
+	SHOW_FLAG(f, CS_FL_EOI);
 	SHOW_FLAG(f, CS_FL_EOS);
+	SHOW_FLAG(f, CS_FL_ERR_PENDING);
+	SHOW_FLAG(f, CS_FL_WANT_ROOM);
 	SHOW_FLAG(f, CS_FL_RCV_MORE);
 	SHOW_FLAG(f, CS_FL_ERROR);
 	SHOW_FLAG(f, CS_FL_SHWS);
 	SHOW_FLAG(f, CS_FL_SHWN);
 	SHOW_FLAG(f, CS_FL_SHRR);
 	SHOW_FLAG(f, CS_FL_SHRD);
-	SHOW_FLAG(f, CS_FL_DATA_WR_ENA);
-	SHOW_FLAG(f, CS_FL_DATA_RD_ENA);
 
 	if (f) {
 		printf("EXTRA(0x%08x)", f);
@@ -201,8 +208,6 @@ void show_si_et(unsigned int f)
 
 void show_si_flags(unsigned int f)
 {
-	f &= 0xFFFF;
-
 	printf("si->flags   = ");
 	if (!f) {
 		printf("SI_FL_NONE\n");
@@ -211,7 +216,7 @@ void show_si_flags(unsigned int f)
 
 	SHOW_FLAG(f, SI_FL_EXP);
 	SHOW_FLAG(f, SI_FL_ERR);
-	SHOW_FLAG(f, SI_FL_WAIT_ROOM);
+	SHOW_FLAG(f, SI_FL_RXBLK_ROOM);
 	SHOW_FLAG(f, SI_FL_WAIT_DATA);
 	SHOW_FLAG(f, SI_FL_ISBACK);
 	SHOW_FLAG(f, SI_FL_DONT_WAKE);
@@ -219,11 +224,16 @@ void show_si_flags(unsigned int f)
 	SHOW_FLAG(f, SI_FL_NOLINGER);
 	SHOW_FLAG(f, SI_FL_NOHALF);
 	SHOW_FLAG(f, SI_FL_SRC_ADDR);
-	SHOW_FLAG(f, SI_FL_WANT_PUT);
 	SHOW_FLAG(f, SI_FL_WANT_GET);
+	SHOW_FLAG(f, SI_FL_CLEAN_ABRT);
+	SHOW_FLAG(f, SI_FL_RXBLK_CHAN);
+	SHOW_FLAG(f, SI_FL_RXBLK_BUFF);
+	SHOW_FLAG(f, SI_FL_RXBLK_ROOM);
+	SHOW_FLAG(f, SI_FL_RXBLK_SHUT);
+	SHOW_FLAG(f, SI_FL_RX_WAIT_EP);
 
 	if (f) {
-		printf("EXTRA(0x%04x)", f);
+		printf("EXTRA(0x%08x)", f);
 	}
 	putchar('\n');
 }
@@ -268,7 +278,6 @@ void show_txn_flags(unsigned int f)
 	SHOW_FLAG(f, TX_HDR_CONN_PRS);
 	SHOW_FLAG(f, TX_WAIT_NEXT_RQ);
 	SHOW_FLAG(f, TX_HDR_CONN_UPG);
-	SHOW_FLAG(f, TX_PREFER_LAST);
 	SHOW_FLAG(f, TX_CON_KAL_SET);
 	SHOW_FLAG(f, TX_CON_CLO_SET);
 
@@ -357,11 +366,8 @@ void show_strm_flags(unsigned int f)
 	case SF_ERR_CHK_PORT: f &= ~SF_ERR_MASK ; printf("SF_ERR_CHK_PORT%s",       f ? " | " : ""); break;
 	}
 
-	SHOW_FLAG(f, SF_TUNNEL);
 	SHOW_FLAG(f, SF_REDIRECTABLE);
-	SHOW_FLAG(f, SF_CONN_TAR);
 	SHOW_FLAG(f, SF_REDISP);
-	SHOW_FLAG(f, SF_INITIALIZED);
 	SHOW_FLAG(f, SF_CURR_SESS);
 	SHOW_FLAG(f, SF_MONITOR);
 	SHOW_FLAG(f, SF_FORCE_PRST);

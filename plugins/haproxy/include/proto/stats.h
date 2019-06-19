@@ -26,6 +26,7 @@
 #include <common/config.h>
 #include <types/applet.h>
 #include <types/stream_interface.h>
+#include <types/stats.h>
 
 
 static inline enum field_format field_format(const struct field *f, int e)
@@ -83,6 +84,8 @@ static inline struct field mkf_str(uint32_t type, const char *value)
 	return f;
 }
 
+extern const char *stat_status_codes[];
+
 /* These two structs contains all field names according with
  * the the number of entries in "enum stat_field" and
  * "enum info_field"
@@ -101,9 +104,10 @@ int stats_fill_be_stats(struct proxy *px, int flags, struct field *stats, int le
 extern struct applet http_stats_applet;
 
 void stats_io_handler(struct stream_interface *si);
-int stats_emit_raw_data_field(struct chunk *out, const struct field *f);
-int stats_emit_typed_data_field(struct chunk *out, const struct field *f);
-int stats_emit_field_tags(struct chunk *out, const struct field *f, char delim);
+int stats_emit_raw_data_field(struct buffer *out, const struct field *f);
+int stats_emit_typed_data_field(struct buffer *out, const struct field *f);
+int stats_emit_field_tags(struct buffer *out, const struct field *f,
+			  char delim);
 
 #endif /* _PROTO_STATS_H */
 

@@ -52,11 +52,17 @@
 #include <grp.h>
 #ifdef USE_CPU_AFFINITY
 #include <sched.h>
-#ifdef __FreeBSD__
+#if defined(__FreeBSD__) || defined(__DragonFly__)
 #include <sys/param.h>
+#ifdef __FreeBSD__
 #include <sys/cpuset.h>
+#endif
 #include <pthread_np.h>
 #endif
+#endif
+
+#if defined(USE_PRCTL)
+#include <sys/prctl.h>
 #endif
 
 #ifdef DEBUG_FULL
@@ -73,9 +79,11 @@
 #include <common/config.h>
 #include <common/defaults.h>
 #include <common/errors.h>
+#include <common/initcall.h>
 #include <common/memory.h>
 #include <common/mini-clist.h>
 #include <common/namespace.h>
+#include <common/openssl-compat.h>
 #include <common/regex.h>
 #include <common/standard.h>
 #include <common/time.h>
@@ -84,24 +92,28 @@
 #include <common/hathreads.h>
 
 #include <types/capture.h>
+#include <types/cli.h>
 #include <types/filters.h>
 #include <types/global.h>
 #include <types/acl.h>
 #include <types/peers.h>
 
 #include <proto/acl.h>
-#include <proto/applet.h>
+#include <proto/activity.h>
 #include <proto/arg.h>
 #include <proto/auth.h>
 #include <proto/backend.h>
 #include <proto/channel.h>
+#include <proto/cli.h>
 #include <proto/connection.h>
 #include <proto/fd.h>
 #include <proto/filters.h>
 #include <proto/hdr_idx.h>
 #include <proto/hlua.h>
+#include <proto/http_rules.h>
 #include <proto/listener.h>
 #include <proto/log.h>
+#include <proto/mworker.h>
 #include <proto/pattern.h>
 #include <proto/protocol.h>
 #include <proto/proto_http.h>
@@ -114,21 +126,24 @@
 #include <proto/task.h>
 #include <proto/dns.h>
 #include <proto/vars.h>
-#ifdef USE_OPENSSL
 #include <proto/ssl_sock.h>
-#endif
+
+/* array of init calls for older platforms */
+DECLARE_INIT_STAGES;
 
 /* list of config files */
 static struct list cfg_cfgfiles = LIST_HEAD_INIT(cfg_cfgfiles);
 int  pid;			/* current process id */
 int  relative_pid = 1;		/* process id starting at 1 */
 unsigned long pid_bit = 1;      /* bit corresponding to the process id */
+unsigned long all_proc_mask = 1; /* mask of all processes */
 
+volatile unsigned long sleeping_thread_mask; /* Threads that are about to sleep in poll() */
 /* global options */
 struct global global = {
 	.hard_stop_after = TICK_ETERNITY,
 	.nbproc = 1,
-	.nbthread = 1,
+	.nbthread = 0,
 	.req_count = 0,
 	.logsrvs = LIST_HEAD_INIT(global.logsrvs),
 	.maxzlibmem = 0,
@@ -142,11 +157,14 @@ struct global global = {
 		 }
 	},
 	.tune = {
-		.bufsize = BUFSIZE,
+		.options = GTUNE_LISTENER_MQ,
+		.bufsize = (BUFSIZE + 2*sizeof(void *) - 1) & -(2*sizeof(void *)),
 		.maxrewrite = -1,
-		.chksize = BUFSIZE,
+		.chksize = (BUFSIZE + 2*sizeof(void *) - 1) & -(2*sizeof(void *)),
 		.reserved_bufs = RESERVED_BUFS,
 		.pattern_cache = DEFAULT_PAT_LRU_SIZE,
+		.pool_low_ratio  = 20,
+		.pool_high_ratio = 25,
 #ifdef USE_OPENSSL
 		.sslcachesize = SSLCACHESIZE,
 #endif
@@ -165,13 +183,14 @@ struct global global = {
 	/* others NULL OK */
 };
 
-struct activity activity[MAX_THREADS] __attribute__((aligned(64))) = { };
-
 /*********************************************************************/
 
 int stopping;	/* non zero means stopping in progress */
 int killed;	/* non zero means a hard-stop is triggered */
 int jobs = 0;   /* number of active jobs (conns, listeners, active tasks, ...) */
+int unstoppable_jobs = 0;  /* number of active jobs that can't be stopped during a soft stop */
+int active_peers = 0; /* number of active peers (connection attempts and connected) */
+int connected_peers = 0; /* number of connected peers (verified ones) */
 
 /* Here we store informations about the pids of the processes we may pause
  * or kill. We will send them a signal every 10 ms until we can bind to all
@@ -201,21 +220,28 @@ char localpeer[MAX_HOSTNAME_LEN];
  */
 int shut_your_big_mouth_gcc_int = 0;
 
-int *children = NULL; /* store PIDs of children in master workers mode */
-
-static volatile sig_atomic_t caught_signal = 0;
 static char **next_argv = NULL;
 
-int mworker_pipe[2];
+struct list proc_list = LIST_HEAD_INIT(proc_list);
+
+int master = 0; /* 1 if in master, 0 if in child */
+unsigned int rlim_fd_cur_at_boot = 0;
+unsigned int rlim_fd_max_at_boot = 0;
+
+struct mworker_proc *proc_self = NULL;
 
 /* list of the temporarily limited listeners because of lack of resource */
 struct list global_listener_queue = LIST_HEAD_INIT(global_listener_queue);
 struct task *global_listener_queue_task;
-static struct task *manage_global_listener_queue(struct task *t);
+static struct task *manage_global_listener_queue(struct task *t, void *context, unsigned short state);
+
+static void *run_thread_poll_loop(void *data);
 
 /* bitfield of a few warnings to emit just once (WARN_*) */
 unsigned int warned = 0;
 
+/* master CLI configuration (-S flag) */
+struct list mworker_cli_conf = LIST_HEAD_INIT(mworker_cli_conf);
 
 /* These are strings to be reported in the output of "haproxy -vv". They may
  * either be constants (in which case must_free must be zero) or dynamically
@@ -242,15 +268,14 @@ struct post_check_fct {
 	int (*fct)();
 };
 
-/* These functions are called when freeing the global sections at the end
- * of deinit, after everything is stopped. They don't return anything, and
- * they work in best effort mode as their sole goal is to make valgrind
- * mostly happy.
- */
-struct list post_deinit_list = LIST_HEAD_INIT(post_deinit_list);
-struct post_deinit_fct {
+/* These functions are called for each thread just after the thread creation
+ * and before running the init functions. They should be used to do per-thread
+ * (re-)allocations that are needed by subsequent functoins. They must return 0
+ * if an error occurred. */
+struct list per_thread_alloc_list = LIST_HEAD_INIT(per_thread_alloc_list);
+struct per_thread_alloc_fct {
 	struct list list;
-	void (*fct)();
+	int (*fct)();
 };
 
 /* These functions are called for each thread just after the thread creation
@@ -258,6 +283,29 @@ struct post_deinit_fct {
  * initializations. They must return 0 if an error occurred. */
 struct list per_thread_init_list = LIST_HEAD_INIT(per_thread_init_list);
 struct per_thread_init_fct {
+	struct list list;
+	int (*fct)();
+};
+
+/* These functions are called when freeing the global sections at the end of
+ * deinit, after everything is stopped. They don't return anything. They should
+ * not release shared resources that are possibly used by other deinit
+ * functions, only close/release what is private. Use the per_thread_free_list
+ * to release shared resources.
+ */
+struct list post_deinit_list = LIST_HEAD_INIT(post_deinit_list);
+struct post_deinit_fct {
+	struct list list;
+	void (*fct)();
+};
+
+/* These functions are called when freeing the global sections at the end of
+ * deinit, after the thread deinit functions, to release unneeded memory
+ * allocations. They don't return anything, and they work in best effort mode
+ * as their sole goal is to make valgrind mostly happy.
+ */
+struct list per_thread_free_list = LIST_HEAD_INIT(per_thread_free_list);
+struct per_thread_free_fct {
 	struct list list;
 	int (*fct)();
 };
@@ -323,6 +371,20 @@ void hap_register_post_deinit(void (*fct)())
 	LIST_ADDQ(&post_deinit_list, &b->list);
 }
 
+/* used to register some allocation functions to call for each thread. */
+void hap_register_per_thread_alloc(int (*fct)())
+{
+	struct per_thread_alloc_fct *b;
+
+	b = calloc(1, sizeof(*b));
+	if (!b) {
+		fprintf(stderr, "out of memory\n");
+		exit(1);
+	}
+	b->fct = fct;
+	LIST_ADDQ(&per_thread_alloc_list, &b->list);
+}
+
 /* used to register some initialization functions to call for each thread. */
 void hap_register_per_thread_init(int (*fct)())
 {
@@ -351,10 +413,23 @@ void hap_register_per_thread_deinit(void (*fct)())
 	LIST_ADDQ(&per_thread_deinit_list, &b->list);
 }
 
+/* used to register some free functions to call for each thread. */
+void hap_register_per_thread_free(int (*fct)())
+{
+	struct per_thread_free_fct *b;
+
+	b = calloc(1, sizeof(*b));
+	if (!b) {
+		fprintf(stderr, "out of memory\n");
+		exit(1);
+	}
+	b->fct = fct;
+	LIST_ADDQ(&per_thread_free_list, &b->list);
+}
+
 static void display_version()
 {
-	printf("HA-Proxy version " HAPROXY_VERSION " " HAPROXY_DATE"\n");
-	printf("Copyright 2000-2019 Willy Tarreau <willy@haproxy.org>\n\n");
+	printf("HA-Proxy version %s %s - https://haproxy.org/\n", haproxy_version, haproxy_date);
 }
 
 static void display_build_opts()
@@ -377,10 +452,13 @@ static void display_build_opts()
 #ifdef BUILD_OPTIONS
 	       "\n  OPTIONS = " BUILD_OPTIONS
 #endif
+#ifdef BUILD_FEATURES
+	       "\n\nFeature list : " BUILD_FEATURES
+#endif
 	       "\n\nDefault settings :"
-	       "\n  maxconn = %d, bufsize = %d, maxrewrite = %d, maxpollevents = %d"
+	       "\n  bufsize = %d, maxrewrite = %d, maxpollevents = %d"
 	       "\n\n",
-	       DEFAULT_MAXCONN, BUFSIZE, MAXREWRITE, MAX_POLL_EVENTS);
+	       BUFSIZE, MAXREWRITE, MAX_POLL_EVENTS);
 
 	list_for_each_entry(item, &build_opts_list, list) {
 		puts(item->str);
@@ -389,6 +467,10 @@ static void display_build_opts()
 	putchar('\n');
 
 	list_pollers(stdout);
+	putchar('\n');
+	list_mux_proto(stdout);
+	putchar('\n');
+	list_services(stdout);
 	putchar('\n');
 	list_filters(stdout);
 	putchar('\n');
@@ -415,21 +497,24 @@ static void usage(char *name)
 #endif
 		"        -q quiet mode : don't display messages\n"
 		"        -c check mode : only check config files and exit\n"
-		"        -n sets the maximum total # of connections (%d)\n"
+		"        -n sets the maximum total # of connections (uses ulimit -n)\n"
 		"        -m limits the usable amount of memory (in MB)\n"
 		"        -N sets the default, per-proxy maximum # of connections (%d)\n"
 		"        -L set local peer name (default to hostname)\n"
 		"        -p writes pids of all children to this file\n"
-#if defined(ENABLE_EPOLL)
+#if defined(USE_EPOLL)
 		"        -de disables epoll() usage even when available\n"
 #endif
-#if defined(ENABLE_KQUEUE)
+#if defined(USE_KQUEUE)
 		"        -dk disables kqueue() usage even when available\n"
 #endif
-#if defined(ENABLE_POLL)
+#if defined(USE_EVPORTS)
+		"        -dv disables event ports usage even when available\n"
+#endif
+#if defined(USE_POLL)
 		"        -dp disables poll() usage even when available\n"
 #endif
-#if defined(CONFIG_HAP_LINUX_SPLICE)
+#if defined(USE_LINUX_SPLICE)
 		"        -dS disables splice usage (broken on old kernels)\n"
 #endif
 #if defined(USE_GETADDRINFO)
@@ -442,8 +527,9 @@ static void usage(char *name)
 		"        -dV disables SSL verify on servers side\n"
 		"        -sf/-st [pid ]* finishes/terminates old pids.\n"
 		"        -x <unix_socket> get listening sockets from a unix socket\n"
+		"        -S <bind>[,<bind options>...] new master CLI\n"
 		"\n",
-		name, DEFAULT_MAXCONN, cfg_maxpconn);
+		name, cfg_maxpconn);
 	exit(1);
 }
 
@@ -456,7 +542,7 @@ static void usage(char *name)
 /* sends the signal <sig> to all pids found in <oldpids>. Returns the number of
  * pids the signal was correctly delivered to.
  */
-static int tell_old_pids(int sig)
+int tell_old_pids(int sig)
 {
 	int p;
 	int ret = 0;
@@ -465,132 +551,6 @@ static int tell_old_pids(int sig)
 			ret++;
 	return ret;
 }
-
-/* return 1 if a pid is a current child otherwise 0 */
-
-int current_child(int pid)
-{
-	int i;
-
-	for (i = 0; i < global.nbproc; i++) {
-		if (children[i] == pid)
-			return 1;
-	}
-	return 0;
-}
-
-static void mworker_signalhandler(int signum)
-{
-	caught_signal = signum;
-}
-
-static void mworker_register_signals()
-{
-	struct sigaction sa;
-	/* Here we are not using the haproxy async way
-	for signals because it does not exists in
-	the master */
-	memset(&sa, 0, sizeof(struct sigaction));
-	sa.sa_handler = &mworker_signalhandler;
-	sigaction(SIGHUP, &sa, NULL);
-	sigaction(SIGUSR1, &sa, NULL);
-	sigaction(SIGUSR2, &sa, NULL);
-	sigaction(SIGINT, &sa, NULL);
-	sigaction(SIGTERM, &sa, NULL);
-}
-
-static void mworker_block_signals()
-{
-	sigset_t set;
-
-	sigemptyset(&set);
-	sigaddset(&set, SIGUSR1);
-	sigaddset(&set, SIGUSR2);
-	sigaddset(&set, SIGHUP);
-	sigaddset(&set, SIGINT);
-	sigaddset(&set, SIGTERM);
-	ha_sigmask(SIG_SETMASK, &set, NULL);
-}
-
-static void mworker_unblock_signals()
-{
-	sigset_t set;
-
-	sigemptyset(&set);
-	sigaddset(&set, SIGUSR1);
-	sigaddset(&set, SIGUSR2);
-	sigaddset(&set, SIGHUP);
-	sigaddset(&set, SIGINT);
-	sigaddset(&set, SIGTERM);
-	ha_sigmask(SIG_UNBLOCK, &set, NULL);
-}
-
-static void mworker_unregister_signals()
-{
-	signal(SIGINT, SIG_DFL);
-	signal(SIGTERM, SIG_DFL);
-	signal(SIGHUP,  SIG_IGN);
-	signal(SIGUSR1, SIG_IGN);
-	signal(SIGUSR2, SIG_IGN);
-}
-
-/*
- * Send signal to every known children.
- */
-
-static void mworker_kill(int sig)
-{
-	int i;
-
-	tell_old_pids(sig);
-	if (children) {
-		for (i = 0; i < global.nbproc; i++)
-			kill(children[i], sig);
-	}
-}
-
-/*
- * Upon a reload, the master worker needs to close all listeners FDs but the mworker_pipe
- * fd, and the FD provided by fd@
- */
-static void mworker_cleanlisteners()
-{
-	struct listener *l, *l_next;
-	struct proxy *curproxy;
-	struct peers *curpeers;
-
-	for (curproxy = proxies_list; curproxy; curproxy = curproxy->next) {
-		/* we might have to unbind some peers sections from some processes */
-		for (curpeers = cfg_peers; curpeers; curpeers = curpeers->next) {
-			if (!curpeers->peers_fe)
-				continue;
-
-			stop_proxy(curpeers->peers_fe);
-			/* disable this peer section so that it kills itself */
-			signal_unregister_handler(curpeers->sighandler);
-			task_delete(curpeers->sync_task);
-			task_free(curpeers->sync_task);
-			curpeers->sync_task = NULL;
-			task_free(curpeers->peers_fe->task);
-			curpeers->peers_fe->task = NULL;
-			curpeers->peers_fe = NULL;
-		}
-
-		list_for_each_entry_safe(l, l_next, &curproxy->conf.listeners, by_fe) {
-			/* does not close if the FD is inherited with fd@
-			 * from the parent process */
-			if (!(l->options & LI_O_INHERITED)) {
-				close(l->fd);
-				LIST_DEL(&l->by_fe);
-				LIST_DEL(&l->by_bind);
-				free(l->name);
-				free(l->counters);
-				free(l);
-			}
-		}
-	}
-}
-
 
 /*
  * remove a pid forom the olpid array and decrease nb_oldpids
@@ -650,50 +610,77 @@ static void get_cur_unixsocket()
 
 /*
  * When called, this function reexec haproxy with -sf followed by current
- * children PIDs and possibily old children PIDs if they didn't leave yet.
+ * children PIDs and possibly old children PIDs if they didn't leave yet.
  */
-static void mworker_reload()
+void mworker_reload()
 {
 	int next_argc = 0;
-	int j;
 	char *msg = NULL;
+	struct rlimit limit;
+	struct per_thread_deinit_fct *ptdf;
 
 	mworker_block_signals();
-	mworker_unregister_signals();
 #if defined(USE_SYSTEMD)
 	if (global.tune.options & GTUNE_USE_SYSTEMD)
 		sd_notify(0, "RELOADING=1");
 #endif
 	setenv("HAPROXY_MWORKER_REEXEC", "1", 1);
 
+	mworker_proc_list_to_env(); /* put the children description in the env */
+
+	/* during the reload we must ensure that every FDs that can't be
+	 * reuse (ie those that are not referenced in the proc_list)
+	 * are closed or they will leak. */
+
+	/* close the listeners FD */
+	mworker_cli_proxy_stop();
+	/* close the poller FD and the thread waker pipe FD */
+	list_for_each_entry(ptdf, &per_thread_deinit_list, list)
+		ptdf->fct();
+	if (fdtab)
+		deinit_pollers();
+#if defined(USE_OPENSSL) && (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L)
+	if (global.ssl_used_frontend || global.ssl_used_backend)
+		/* close random device FDs */
+		RAND_keep_random_devices_open(0);
+#endif
+
+	/* restore the initial FD limits */
+	limit.rlim_cur = rlim_fd_cur_at_boot;
+	limit.rlim_max = rlim_fd_max_at_boot;
+	if (setrlimit(RLIMIT_NOFILE, &limit) == -1) {
+		getrlimit(RLIMIT_NOFILE, &limit);
+		ha_warning("Failed to restore initial FD limits (cur=%u max=%u), using cur=%u max=%u\n",
+			   rlim_fd_cur_at_boot, rlim_fd_max_at_boot,
+			   (unsigned int)limit.rlim_cur, (unsigned int)limit.rlim_max);
+	}
+
 	/* compute length  */
 	while (next_argv[next_argc])
 		next_argc++;
 
 	/* 1 for haproxy -sf, 2 for -x /socket */
-	next_argv = realloc(next_argv, (next_argc + 1 + 2 + global.nbproc + nb_oldpids + 1) * sizeof(char *));
+	next_argv = realloc(next_argv, (next_argc + 1 + 2 + mworker_child_nb() + nb_oldpids + 1) * sizeof(char *));
 	if (next_argv == NULL)
 		goto alloc_error;
 
-
 	/* add -sf <PID>*  to argv */
-	if (children || nb_oldpids > 0)
+	if (mworker_child_nb() > 0) {
+		struct mworker_proc *child;
+
 		next_argv[next_argc++] = "-sf";
-	if (children) {
-		for (j = 0; j < global.nbproc; next_argc++,j++) {
-			next_argv[next_argc] = memprintf(&msg, "%d", children[j]);
+
+		list_for_each_entry(child, &proc_list, list) {
+			if (!(child->options & (PROC_O_TYPE_WORKER|PROC_O_TYPE_PROG)))
+				continue;
+			next_argv[next_argc] = memprintf(&msg, "%d", child->pid);
 			if (next_argv[next_argc] == NULL)
 				goto alloc_error;
 			msg = NULL;
+			next_argc++;
 		}
 	}
-	/* copy old process PIDs */
-	for (j = 0; j < nb_oldpids; next_argc++,j++) {
-		next_argv[next_argc] = memprintf(&msg, "%d", oldpids[j]);
-		if (next_argv[next_argc] == NULL)
-			goto alloc_error;
-		msg = NULL;
-	}
+
 	next_argv[next_argc] = NULL;
 
 	/* add the -x option with the stat socket */
@@ -711,85 +698,57 @@ static void mworker_reload()
 	return;
 
 alloc_error:
-	ha_warning("Failed to reexecute the master processs [%d]: Cannot allocate memory\n", pid);
+	ha_warning("Failed to reexecute the master process [%d]: Cannot allocate memory\n", pid);
 	return;
 }
 
-
-/*
- * Wait for every children to exit
- */
-
-static void mworker_wait()
+static void mworker_loop()
 {
-	int exitpid = -1;
-	int status = 0;
-
-restart_wait:
 
 #if defined(USE_SYSTEMD)
 	if (global.tune.options & GTUNE_USE_SYSTEMD)
 		sd_notifyf(0, "READY=1\nMAINPID=%lu", (unsigned long)getpid());
 #endif
+	/* Busy polling makes no sense in the master :-) */
+	global.tune.options &= ~GTUNE_BUSY_POLLING;
 
-	mworker_register_signals();
+	master = 1;
+
+	signal_unregister(SIGUSR1);
+	signal_unregister(SIGHUP);
+	signal_unregister(SIGQUIT);
+
+	signal_register_fct(SIGTERM, mworker_catch_sigterm, SIGTERM);
+	signal_register_fct(SIGUSR1, mworker_catch_sigterm, SIGUSR1);
+	signal_register_fct(SIGINT, mworker_catch_sigterm, SIGINT);
+	signal_register_fct(SIGHUP, mworker_catch_sighup, SIGHUP);
+	signal_register_fct(SIGUSR2, mworker_catch_sighup, SIGUSR2);
+	signal_register_fct(SIGCHLD, mworker_catch_sigchld, SIGCHLD);
+
 	mworker_unblock_signals();
+	mworker_cleanlisteners();
+	mworker_cleantasks();
 
-	while (1) {
+	mworker_catch_sigchld(NULL); /* ensure we clean the children in case
+				     some SIGCHLD were lost */
 
-		while (((exitpid = wait(&status)) == -1) && errno == EINTR) {
-			int sig = caught_signal;
-			if (sig == SIGUSR2 || sig == SIGHUP) {
-				mworker_reload();
-				/* should reach there only if it fail */
-				goto restart_wait;
-			} else {
-#if defined(USE_SYSTEMD)
-				if ((global.tune.options & GTUNE_USE_SYSTEMD) && (sig == SIGUSR1 || sig == SIGTERM)) {
-					sd_notify(0, "STOPPING=1");
-				}
+	global.nbthread = 1;
+	relative_pid = 1;
+	pid_bit = 1;
+	all_proc_mask = 1;
+
+#ifdef USE_THREAD
+	tid_bit = 1;
+	all_threads_mask = 1;
 #endif
-				ha_warning("Exiting Master process...\n");
-				mworker_kill(sig);
-				mworker_unregister_signals();
-			}
-			caught_signal = 0;
-		}
 
-		if (exitpid == -1 && errno == ECHILD) {
-			ha_warning("All workers exited. Exiting... (%d)\n", status);
-			atexit_flag = 0;
-			exit(status); /* parent must leave using the latest status code known */
-		}
+	jobs++; /* this is the "master" job, we want to take care of the
+		signals even if there is no listener so the poll loop don't
+		leave */
 
-		if (WIFEXITED(status))
-			status = WEXITSTATUS(status);
-		else if (WIFSIGNALED(status))
-			status = 128 + WTERMSIG(status);
-		else if (WIFSTOPPED(status))
-			status = 128 + WSTOPSIG(status);
-		else
-			status = 255;
-
-		if (!children) {
-			ha_warning("Worker %d exited with code %d\n", exitpid, status);
-		} else {
-			/* check if exited child was in the current children list */
-			if (current_child(exitpid)) {
-				ha_alert("Current worker %d exited with code %d\n", exitpid, status);
-				if (status != 0 && status != 130 && status != 143
-				    && !(global.tune.options & GTUNE_NOEXIT_ONFAILURE)) {
-					ha_alert("exit-on-failure: killing every workers with SIGTERM\n");
-					mworker_kill(SIGTERM);
-				}
-			} else {
-				ha_warning("Former worker %d exited with code %d\n", exitpid, status);
-				delete_oldpid(exitpid);
-			}
-		}
-	}
+	fork_poller();
+	run_thread_poll_loop(0);
 }
-
 
 /*
  * Reexec the process in failure mode, instead of exiting
@@ -853,8 +812,8 @@ static void sig_dump_state(struct sig_handler *sh)
 			             p->id, s->id,
 			             (s->cur_state != SRV_ST_STOPPED) ? "UP" : "DOWN",
 			             s->cur_sess, s->nbpend, s->counters.cum_sess);
-			ha_warning("%s\n", trash.str);
-			send_log(p, LOG_NOTICE, "%s\n", trash.str);
+			ha_warning("%s\n", trash.area);
+			send_log(p, LOG_NOTICE, "%s\n", trash.area);
 			s = s->next;
 		}
 
@@ -877,8 +836,8 @@ static void sig_dump_state(struct sig_handler *sh)
 			             p->id, p->srv_act, p->srv_bck,
 			             p->feconn, p->beconn, p->totpend, p->nbpend, p->fe_counters.cum_conn, p->be_counters.cum_conn);
 		}
-		ha_warning("%s\n", trash.str);
-		send_log(p, LOG_NOTICE, "%s\n", trash.str);
+		ha_warning("%s\n", trash.area);
+		send_log(p, LOG_NOTICE, "%s\n", trash.area);
 
 		p = p->next;
 	}
@@ -921,11 +880,11 @@ static void stdio_quiet(int fd)
 }
 
 
-/* This function check if cfg_cfgfiles containes directories.
- * If it find one, it add all the files (and only files) it containes
- * in cfg_cfgfiles in place of the directory (and remove the directory).
- * It add the files in lexical order.
- * It add only files with .cfg extension.
+/* This function checks if cfg_cfgfiles contains directories.
+ * If it finds one, it adds all the files (and only files) it contains
+ * in cfg_cfgfiles in place of the directory (and removes the directory).
+ * It adds the files in lexical order.
+ * It adds only files with .cfg extension.
  * It doesn't add files with name starting with '.'
  */
 static void cfgfiles_expand_directories(void)
@@ -966,7 +925,7 @@ static void cfgfiles_expand_directories(void)
 			char *d_name_cfgext = strstr(dir_entry->d_name, ".cfg");
 
 			/* don't add filename that begin with .
-			 * only add filename with .cfg extention
+			 * only add filename with .cfg extension
 			 */
 			if (dir_entry->d_name[0] == '.' ||
 			    !(d_name_cfgext && d_name_cfgext[4] == '\0'))
@@ -1260,6 +1219,110 @@ static char **copy_argv(int argc, char **argv)
 	return newargv;
 }
 
+/* considers splicing proxies' maxconn, computes the ideal global.maxpipes
+ * setting, and returns it. It may return -1 meaning "unlimited" if some
+ * unlimited proxies have been found and the global.maxconn value is not yet
+ * set. It may also return a value greater than maxconn if it's not yet set.
+ * Note that a value of zero means there is no need for pipes. -1 is never
+ * returned if global.maxconn is valid.
+ */
+static int compute_ideal_maxpipes()
+{
+	struct proxy *cur;
+	int nbfe = 0, nbbe = 0;
+	int unlimited = 0;
+	int pipes;
+	int max;
+
+	for (cur = proxies_list; cur; cur = cur->next) {
+		if (cur->options2 & (PR_O2_SPLIC_ANY)) {
+			if (cur->cap & PR_CAP_FE) {
+				max = cur->maxconn;
+				nbfe += max;
+				if (!max) {
+					unlimited = 1;
+					break;
+				}
+			}
+			if (cur->cap & PR_CAP_BE) {
+				max = cur->fullconn ? cur->fullconn : global.maxconn;
+				nbbe += max;
+				if (!max) {
+					unlimited = 1;
+					break;
+				}
+			}
+		}
+	}
+
+	pipes = MAX(nbfe, nbbe);
+	if (global.maxconn) {
+		if (pipes > global.maxconn || unlimited)
+			pipes = global.maxconn;
+	} else if (unlimited) {
+		pipes = -1;
+	}
+
+	return pipes >= 4 ? pipes / 4 : pipes;
+}
+
+/* considers global.maxsocks, global.maxpipes, async engines, SSL frontends and
+ * rlimits and computes an ideal maxconn. It's meant to be called only when
+ * maxsock contains the sum of listening FDs, before it is updated based on
+ * maxconn and pipes. If there are not enough FDs left, DEFAULT_MAXCONN (by
+ * default 100) is returned as it is expected that it will even run on tight
+ * environments, and will maintain compatibility with previous packages that
+ * used to rely on this value as the default one. The system will emit a
+ * warning indicating how many FDs are missing anyway if needed.
+ */
+static int compute_ideal_maxconn()
+{
+	int ssl_sides = !!global.ssl_used_frontend + !!global.ssl_used_backend;
+	int engine_fds = global.ssl_used_async_engines * ssl_sides;
+	int pipes = compute_ideal_maxpipes();
+	int remain = rlim_fd_cur_at_boot;
+	int maxconn;
+
+	/* we have to take into account these elements :
+	 *   - number of engine_fds, which inflates the number of FD needed per
+	 *     connection by this number.
+	 *   - number of pipes per connection on average : for the unlimited
+	 *     case, this is 0.5 pipe FDs per connection, otherwise it's a
+	 *     fixed value of 2*pipes.
+	 *   - two FDs per connection
+	 */
+
+	/* subtract listeners and checks */
+	remain -= global.maxsock;
+
+	/* one epoll_fd/kqueue_fd per thread */
+	remain -= global.nbthread;
+
+	/* one wake-up pipe (2 fd) per thread */
+	remain -= 2 * global.nbthread;
+
+	/* Fixed pipes values : we only subtract them if they're not larger
+	 * than the remaining FDs because pipes are optional.
+	 */
+	if (pipes >= 0 && pipes * 2 < remain)
+		remain -= pipes * 2;
+
+	if (pipes < 0) {
+		/* maxsock = maxconn * 2 + maxconn/4 * 2 + maxconn * engine_fds.
+		 *         = maxconn * (2 + 0.5 + engine_fds)
+		 *         = maxconn * (4 + 1 + 2*engine_fds) / 2
+		 */
+		maxconn = 2 * remain / (5 + 2 * engine_fds);
+	} else {
+		/* maxsock = maxconn * 2 + maxconn * engine_fds.
+		 *         = maxconn * (2 + engine_fds)
+		 */
+		maxconn = remain / (2 + engine_fds);
+	}
+
+	return MAX(maxconn, DEFAULT_MAXCONN);
+}
+
 /*
  * This function initializes all the necessary variables. It only returns
  * if everything is OK. If something fails, it exits.
@@ -1276,6 +1339,7 @@ static void init(int argc, char **argv)
 	char *change_dir = NULL;
 	struct proxy *px;
 	struct post_check_fct *pcf;
+	int ideal_maxconn;
 
 	global.mode = MODE_STARTING;
 	next_argv = copy_argv(argc, argv);
@@ -1293,12 +1357,13 @@ static void init(int argc, char **argv)
 	gethostname(hostname, sizeof(hostname) - 1);
 	memset(localpeer, 0, sizeof(localpeer));
 	memcpy(localpeer, hostname, (sizeof(hostname) > sizeof(localpeer) ? sizeof(localpeer) : sizeof(hostname)) - 1);
+	setenv("HAPROXY_LOCALPEER", localpeer, 1);
 
 	/*
 	 * Initialize the previously static variables.
 	 */
 
-	totalconn = actconn = maxfd = listeners = stopping = 0;
+	totalconn = actconn = listeners = stopping = 0;
 	killed = 0;
 
 
@@ -1312,17 +1377,15 @@ static void init(int argc, char **argv)
 
 	srandom(now_ms - getpid());
 
-	init_log();
-	signal_init();
 	if (init_acl() != 0)
 		exit(1);
-	init_task();
-	init_stream();
-	init_session();
-	init_connection();
+
 	/* warning, we init buffers later */
-	init_pendconn();
-	init_proto_http();
+	if (!init_http(&err_msg)) {
+		ha_alert("%s. Aborting.\n", err_msg);
+		free(err_msg);
+		abort();
+	}
 
 	/* Initialise lua. */
 	hlua_init();
@@ -1331,16 +1394,19 @@ static void init(int argc, char **argv)
 	vars_init(&global.vars, SCOPE_PROC);
 
 	global.tune.options |= GTUNE_USE_SELECT;  /* select() is always available */
-#if defined(ENABLE_POLL)
+#if defined(USE_POLL)
 	global.tune.options |= GTUNE_USE_POLL;
 #endif
-#if defined(ENABLE_EPOLL)
+#if defined(USE_EPOLL)
 	global.tune.options |= GTUNE_USE_EPOLL;
 #endif
-#if defined(ENABLE_KQUEUE)
+#if defined(USE_KQUEUE)
 	global.tune.options |= GTUNE_USE_KQUEUE;
 #endif
-#if defined(CONFIG_HAP_LINUX_SPLICE)
+#if defined(USE_EVPORTS)
+	global.tune.options |= GTUNE_USE_EVPORTS;
+#endif
+#if defined(USE_LINUX_SPLICE)
 	global.tune.options |= GTUNE_USE_SPLICE;
 #endif
 #if defined(USE_GETADDRINFO)
@@ -1372,19 +1438,23 @@ static void init(int argc, char **argv)
 					display_build_opts();
 				exit(0);
 			}
-#if defined(ENABLE_EPOLL)
+#if defined(USE_EPOLL)
 			else if (*flag == 'd' && flag[1] == 'e')
 				global.tune.options &= ~GTUNE_USE_EPOLL;
 #endif
-#if defined(ENABLE_POLL)
+#if defined(USE_POLL)
 			else if (*flag == 'd' && flag[1] == 'p')
 				global.tune.options &= ~GTUNE_USE_POLL;
 #endif
-#if defined(ENABLE_KQUEUE)
+#if defined(USE_KQUEUE)
 			else if (*flag == 'd' && flag[1] == 'k')
 				global.tune.options &= ~GTUNE_USE_KQUEUE;
 #endif
-#if defined(CONFIG_HAP_LINUX_SPLICE)
+#if defined(USE_EVPORTS)
+			else if (*flag == 'd' && flag[1] == 'v')
+				global.tune.options &= ~GTUNE_USE_EVPORTS;
+#endif
+#if defined(USE_LINUX_SPLICE)
 			else if (*flag == 'd' && flag[1] == 'S')
 				global.tune.options &= ~GTUNE_USE_SPLICE;
 #endif
@@ -1433,6 +1503,22 @@ static void init(int argc, char **argv)
 				if (old_unixsocket)
 					ha_warning("-x option already set, overwriting the value\n");
 				old_unixsocket = argv[1];
+
+				argv++;
+				argc--;
+			}
+			else if (*flag == 'S') {
+				struct wordlist *c;
+
+				if (argc <= 1 || argv[1][0] == '-') {
+					ha_alert("Socket and optional bind parameters expected with the -S flag\n");
+					usage(progname);
+				}
+				if ((c = malloc(sizeof(*c))) == NULL || (c->s = strdup(argv[1])) == NULL) {
+					ha_alert("Cannot allocate memory\n");
+					exit(EXIT_FAILURE);
+				}
+				LIST_ADD(&mworker_cli_conf, &c->list);
 
 				argv++;
 				argc--;
@@ -1496,7 +1582,10 @@ static void init(int argc, char **argv)
 				case 'n' : cfg_maxconn = atol(*argv); break;
 				case 'm' : global.rlimit_memmax_all = atol(*argv); break;
 				case 'N' : cfg_maxpconn = atol(*argv); break;
-				case 'L' : strncpy(localpeer, *argv, sizeof(localpeer) - 1); break;
+				case 'L' :
+					strncpy(localpeer, *argv, sizeof(localpeer) - 1);
+					setenv("HAPROXY_LOCALPEER", localpeer, 1);
+					break;
 				case 'f' :
 					if (!list_append_word(&cfg_cfgfiles, *argv, &err_msg)) {
 						ha_alert("Cannot load configuration file/directory %s : %s\n",
@@ -1518,11 +1607,10 @@ static void init(int argc, char **argv)
 	global.mode |= (arg_mode & (MODE_DAEMON | MODE_MWORKER | MODE_FOREGROUND | MODE_VERBOSE
 				    | MODE_QUIET | MODE_CHECK | MODE_DEBUG));
 
-	/* Master workers wait mode */
-	if ((global.mode & MODE_MWORKER) && (getenv("HAPROXY_MWORKER_WAIT_ONLY") != NULL)) {
-
+	if (getenv("HAPROXY_MWORKER_WAIT_ONLY")) {
 		unsetenv("HAPROXY_MWORKER_WAIT_ONLY");
-		mworker_wait();
+		global.mode |= MODE_MWORKER_WAIT;
+		global.mode &= ~MODE_MWORKER;
 	}
 
 	if ((global.mode & MODE_MWORKER) && (getenv("HAPROXY_MWORKER_REEXEC") != NULL)) {
@@ -1535,48 +1623,136 @@ static void init(int argc, char **argv)
 		exit(1);
 	}
 
-	/* handle cfgfiles that are actualy directories */
-	cfgfiles_expand_directories();
-
-	if (LIST_ISEMPTY(&cfg_cfgfiles))
-		usage(progname);
-
 	global.maxsock = 10; /* reserve 10 fds ; will be incremented by socket eaters */
 
 	init_default_instance();
 
-	list_for_each_entry(wl, &cfg_cfgfiles, list) {
-		int ret;
+	/* in wait mode, we don't try to read the configuration files */
+	if (!(global.mode & MODE_MWORKER_WAIT)) {
+		struct buffer *trash = get_trash_chunk();
 
-		ret = readcfgfile(wl->s);
-		if (ret == -1) {
-			ha_alert("Could not open configuration file %s : %s\n",
-				 wl->s, strerror(errno));
+		/* handle cfgfiles that are actually directories */
+		cfgfiles_expand_directories();
+
+		if (LIST_ISEMPTY(&cfg_cfgfiles))
+			usage(progname);
+
+
+		list_for_each_entry(wl, &cfg_cfgfiles, list) {
+			int ret;
+
+			if (trash->data)
+				chunk_appendf(trash, ";");
+
+			chunk_appendf(trash, "%s", wl->s);
+
+			ret = readcfgfile(wl->s);
+			if (ret == -1) {
+				ha_alert("Could not open configuration file %s : %s\n",
+					 wl->s, strerror(errno));
+				exit(1);
+			}
+			if (ret & (ERR_ABORT|ERR_FATAL))
+				ha_alert("Error(s) found in configuration file : %s\n", wl->s);
+			err_code |= ret;
+			if (err_code & ERR_ABORT)
+				exit(1);
+		}
+
+		/* do not try to resolve arguments nor to spot inconsistencies when
+		 * the configuration contains fatal errors caused by files not found
+		 * or failed memory allocations.
+		 */
+		if (err_code & (ERR_ABORT|ERR_FATAL)) {
+			ha_alert("Fatal errors found in configuration.\n");
 			exit(1);
 		}
-		if (ret & (ERR_ABORT|ERR_FATAL))
-			ha_alert("Error(s) found in configuration file : %s\n", wl->s);
-		err_code |= ret;
-		if (err_code & ERR_ABORT)
-			exit(1);
-	}
+		if (trash->data)
+			setenv("HAPROXY_CFGFILES", trash->area, 1);
 
-	/* do not try to resolve arguments nor to spot inconsistencies when
-	 * the configuration contains fatal errors caused by files not found
-	 * or failed memory allocations.
-	 */
-	if (err_code & (ERR_ABORT|ERR_FATAL)) {
-		ha_alert("Fatal errors found in configuration.\n");
-		exit(1);
 	}
+	if (global.mode & MODE_MWORKER) {
+		int proc;
+		struct mworker_proc *tmproc;
 
-	pattern_finalize_config();
+		setenv("HAPROXY_MWORKER", "1", 1);
+
+		if (getenv("HAPROXY_MWORKER_REEXEC") == NULL) {
+
+			tmproc = calloc(1, sizeof(*tmproc));
+			if (!tmproc) {
+				ha_alert("Cannot allocate process structures.\n");
+				exit(EXIT_FAILURE);
+			}
+			tmproc->options |= PROC_O_TYPE_MASTER; /* master */
+			tmproc->reloads = 0;
+			tmproc->relative_pid = 0;
+			tmproc->pid = pid;
+			tmproc->timestamp = start_date.tv_sec;
+			tmproc->ipc_fd[0] = -1;
+			tmproc->ipc_fd[1] = -1;
+
+			proc_self = tmproc;
+
+			LIST_ADDQ(&proc_list, &tmproc->list);
+		}
+
+		for (proc = 0; proc < global.nbproc; proc++) {
+
+			tmproc = calloc(1, sizeof(*tmproc));
+			if (!tmproc) {
+				ha_alert("Cannot allocate process structures.\n");
+				exit(EXIT_FAILURE);
+			}
+
+			tmproc->options |= PROC_O_TYPE_WORKER; /* worker */
+			tmproc->pid = -1;
+			tmproc->reloads = 0;
+			tmproc->timestamp = -1;
+			tmproc->relative_pid = 1 + proc;
+			tmproc->ipc_fd[0] = -1;
+			tmproc->ipc_fd[1] = -1;
+
+			if (mworker_cli_sockpair_new(tmproc, proc) < 0) {
+				exit(EXIT_FAILURE);
+			}
+
+			LIST_ADDQ(&proc_list, &tmproc->list);
+		}
+	}
+	if (global.mode & (MODE_MWORKER|MODE_MWORKER_WAIT)) {
+		struct wordlist *it, *c;
+
+		mworker_env_to_proc_list(); /* get the info of the children in the env */
+
+
+		if (!LIST_ISEMPTY(&mworker_cli_conf)) {
+
+			if (mworker_cli_proxy_create() < 0) {
+				ha_alert("Can't create the master's CLI.\n");
+				exit(EXIT_FAILURE);
+			}
+
+			list_for_each_entry_safe(c, it, &mworker_cli_conf, list) {
+
+				if (mworker_cli_proxy_new_listener(c->s) < 0) {
+					ha_alert("Can't create the master's CLI.\n");
+					exit(EXIT_FAILURE);
+				}
+				LIST_DEL(&c->list);
+				free(c->s);
+				free(c);
+			}
+		}
+	}
 
 	err_code |= check_config_validity();
 	if (err_code & (ERR_ABORT|ERR_FATAL)) {
 		ha_alert("Fatal errors found in configuration.\n");
 		exit(1);
 	}
+
+	pattern_finalize_config();
 
 	/* recompute the amount of per-process memory depending on nbproc and
 	 * the shared SSL cache size (allowed to exist in all processes).
@@ -1594,7 +1770,7 @@ static void init(int argc, char **argv)
 #endif
 	}
 
-#ifdef CONFIG_HAP_NS
+#ifdef USE_NS
         err_code |= netns_init();
         if (err_code & (ERR_ABORT|ERR_FATAL)) {
                 ha_alert("Failed to initialize namespace support.\n");
@@ -1657,14 +1833,28 @@ static void init(int argc, char **argv)
 	if (cfg_maxconn > 0)
 		global.maxconn = cfg_maxconn;
 
+	if (global.stats_fe)
+		global.maxsock += global.stats_fe->maxconn;
+
+	if (cfg_peers) {
+		/* peers also need to bypass global maxconn */
+		struct peers *p = cfg_peers;
+
+		for (p = cfg_peers; p; p = p->next)
+			if (p->peers_fe)
+				global.maxsock += p->peers_fe->maxconn;
+	}
+
 	if (cfg_pidfile) {
 		free(global.pidfile);
 		global.pidfile = strdup(cfg_pidfile);
 	}
 
 	/* Now we want to compute the maxconn and possibly maxsslconn values.
-	 * It's a bit tricky. If memmax is not set, maxconn defaults to
-	 * DEFAULT_MAXCONN and maxsslconn defaults to DEFAULT_MAXSSLCONN.
+	 * It's a bit tricky. Maxconn defaults to the pre-computed value based
+	 * on rlim_fd_cur and the number of FDs in use due to the configuration,
+	 * and maxsslconn defaults to DEFAULT_MAXSSLCONN. On top of that we can
+	 * enforce a lower limit based on memmax.
 	 *
 	 * If memmax is set, then it depends on which values are set. If
 	 * maxsslconn is set, we use memmax to determine how many cleartext
@@ -1683,9 +1873,11 @@ static void init(int argc, char **argv)
 	 * SYSTEM_MAXCONN is set, we still enforce it as an upper limit for
 	 * maxconn in order to protect the system.
 	 */
+	ideal_maxconn = compute_ideal_maxconn();
+
 	if (!global.rlimit_memmax) {
 		if (global.maxconn == 0) {
-			global.maxconn = DEFAULT_MAXCONN;
+			global.maxconn = ideal_maxconn;
 			if (global.mode & (MODE_VERBOSE|MODE_DEBUG))
 				fprintf(stderr, "Note: setting global.maxconn to %d.\n", global.maxconn);
 		}
@@ -1713,10 +1905,11 @@ static void init(int argc, char **argv)
 			 sides * global.ssl_session_max_cost + // SSL buffers, one per side
 			 global.ssl_handshake_max_cost);       // 1 handshake per connection max
 
+		global.maxconn = MIN(global.maxconn, ideal_maxconn);
 		global.maxconn = round_2dig(global.maxconn);
 #ifdef SYSTEM_MAXCONN
-		if (global.maxconn > DEFAULT_MAXCONN)
-			global.maxconn = DEFAULT_MAXCONN;
+		if (global.maxconn > SYSTEM_MAXCONN)
+			global.maxconn = SYSTEM_MAXCONN;
 #endif /* SYSTEM_MAXCONN */
 		global.maxsslconn = sides * global.maxconn;
 		if (global.mode & (MODE_VERBOSE|MODE_DEBUG))
@@ -1777,10 +1970,11 @@ static void init(int argc, char **argv)
 			clearmem -= (global.ssl_session_max_cost + global.ssl_handshake_max_cost) * (int64_t)global.maxsslconn;
 
 		global.maxconn = clearmem / (STREAM_MAX_COST + 2 * global.tune.bufsize);
+		global.maxconn = MIN(global.maxconn, ideal_maxconn);
 		global.maxconn = round_2dig(global.maxconn);
 #ifdef SYSTEM_MAXCONN
-		if (global.maxconn > DEFAULT_MAXCONN)
-			global.maxconn = DEFAULT_MAXCONN;
+		if (global.maxconn > SYSTEM_MAXCONN)
+			global.maxconn = SYSTEM_MAXCONN;
 #endif /* SYSTEM_MAXCONN */
 
 		if (clearmem <= 0 || !global.maxconn) {
@@ -1803,51 +1997,32 @@ static void init(int argc, char **argv)
 		}
 	}
 
-	if (!global.maxpipes) {
-		/* maxpipes not specified. Count how many frontends and backends
-		 * may be using splicing, and bound that to maxconn.
-		 */
-		struct proxy *cur;
-		int nbfe = 0, nbbe = 0;
-
-		for (cur = proxies_list; cur; cur = cur->next) {
-			if (cur->options2 & (PR_O2_SPLIC_ANY)) {
-				if (cur->cap & PR_CAP_FE)
-					nbfe += cur->maxconn;
-				if (cur->cap & PR_CAP_BE)
-					nbbe += cur->fullconn ? cur->fullconn : global.maxconn;
-			}
-		}
-		global.maxpipes = MAX(nbfe, nbbe);
-		if (global.maxpipes > global.maxconn)
-			global.maxpipes = global.maxconn;
-		global.maxpipes /= 4;
-	}
-
+	if (!global.maxpipes)
+		global.maxpipes = compute_ideal_maxpipes();
 
 	global.hardmaxconn = global.maxconn;  /* keep this max value */
 	global.maxsock += global.maxconn * 2; /* each connection needs two sockets */
 	global.maxsock += global.maxpipes * 2; /* each pipe needs two FDs */
+	global.maxsock += global.nbthread;     /* one epoll_fd/kqueue_fd per thread */
+	global.maxsock += 2 * global.nbthread; /* one wake-up pipe (2 fd) per thread */
+
 	/* compute fd used by async engines */
 	if (global.ssl_used_async_engines) {
 		int sides = !!global.ssl_used_frontend + !!global.ssl_used_backend;
 		global.maxsock += global.maxconn * sides * global.ssl_used_async_engines;
 	}
 
-	if (global.stats_fe)
-		global.maxsock += global.stats_fe->maxconn;
+	/* update connection pool thresholds */
+	global.tune.pool_low_count  = ((long long)global.maxsock * global.tune.pool_low_ratio  + 99) / 100;
+	global.tune.pool_high_count = ((long long)global.maxsock * global.tune.pool_high_ratio + 99) / 100;
 
-	if (cfg_peers) {
-		/* peers also need to bypass global maxconn */
-		struct peers *p = cfg_peers;
-
-		for (p = cfg_peers; p; p = p->next)
-			if (p->peers_fe)
-				global.maxsock += p->peers_fe->maxconn;
-	}
+	proxy_adjust_all_maxconn();
 
 	if (global.tune.maxpollevents <= 0)
 		global.tune.maxpollevents = MAX_POLL_EVENTS;
+
+	if (global.tune.runqueue_depth <= 0)
+		global.tune.runqueue_depth = RUNQUEUE_DEPTH;
 
 	if (global.tune.recv_enough == 0)
 		global.tune.recv_enough = MIN_RECV_AT_ONCE_ENOUGH;
@@ -1907,6 +2082,9 @@ static void init(int argc, char **argv)
 
 	if (!(global.tune.options & GTUNE_USE_KQUEUE))
 		disable_poller("kqueue");
+
+	if (!(global.tune.options & GTUNE_USE_EVPORTS))
+		disable_poller("evports");
 
 	if (!(global.tune.options & GTUNE_USE_EPOLL))
 		disable_poller("epoll");
@@ -2023,7 +2201,7 @@ void deinit(void)
 		free(p->check_req);
 		free(p->cookie_name);
 		free(p->cookie_domain);
-		free(p->url_param_name);
+		free(p->lbprm.arg_str);
 		free(p->capture_name);
 		free(p->monitor_uri);
 		free(p->rdp_cookie_name);
@@ -2035,7 +2213,8 @@ void deinit(void)
 		free(p->conf.lfs_file);
 		free(p->conf.uniqueid_format_string);
 		free(p->conf.uif_file);
-		free(p->lbprm.map.srv);
+		if ((p->lbprm.algo & BE_LB_LKUP) == BE_LB_LKUP_MAP)
+			free(p->lbprm.map.srv);
 
 		if (p->conf.logformat_sd_string != default_rfc5424_sd_log_format)
 			free(p->conf.logformat_sd_string);
@@ -2063,11 +2242,7 @@ void deinit(void)
 		}
 
 		for (exp = p->req_exp; exp != NULL; ) {
-			if (exp->preg) {
-				regex_free(exp->preg);
-				free(exp->preg);
-			}
-
+			regex_free(exp->preg);
 			free((char *)exp->replace);
 			expb = exp;
 			exp = exp->next;
@@ -2075,11 +2250,7 @@ void deinit(void)
 		}
 
 		for (exp = p->rsp_exp; exp != NULL; ) {
-			if (exp->preg) {
-				regex_free(exp->preg);
-				free(exp->preg);
-			}
-
+			regex_free(exp->preg);
 			free((char *)exp->replace);
 			expb = exp;
 			exp = exp->next;
@@ -2120,8 +2291,8 @@ void deinit(void)
 			if (rule->cond) {
 				prune_acl_cond(rule->cond);
 				free(rule->cond);
-				free(rule->file);
 			}
+			free(rule->file);
 			free(rule);
 		}
 
@@ -2146,11 +2317,15 @@ void deinit(void)
 
 		list_for_each_entry_safe(lf, lfb, &p->logformat, list) {
 			LIST_DEL(&lf->list);
+			release_sample_expr(lf->expr);
+			free(lf->arg);
 			free(lf);
 		}
 
 		list_for_each_entry_safe(lf, lfb, &p->logformat_sd, list) {
 			LIST_DEL(&lf->list);
+			release_sample_expr(lf->expr);
+			free(lf->arg);
 			free(lf);
 		}
 
@@ -2183,32 +2358,30 @@ void deinit(void)
 		while (s) {
 			s_next = s->next;
 
-			if (s->check.task) {
-				task_delete(s->check.task);
-				task_free(s->check.task);
-			}
-			if (s->agent.task) {
-				task_delete(s->agent.task);
-				task_free(s->agent.task);
-			}
+			task_destroy(s->check.task);
+			task_destroy(s->agent.task);
 
-			if (s->warmup) {
-				task_delete(s->warmup);
-				task_free(s->warmup);
-			}
+			if (s->check.wait_list.tasklet)
+				tasklet_free(s->check.wait_list.tasklet);
+			if (s->agent.wait_list.tasklet)
+				tasklet_free(s->agent.wait_list.tasklet);
+
+			task_destroy(s->warmup);
 
 			free(s->id);
 			free(s->cookie);
-			free(s->check.bi);
-			free(s->check.bo);
-			free(s->agent.bi);
-			free(s->agent.bo);
+			free(s->check.bi.area);
+			free(s->check.bo.area);
+			free(s->agent.bi.area);
+			free(s->agent.bo.area);
 			free(s->agent.send_string);
 			free(s->hostname_dn);
 			free((char*)s->conf.file);
 			free(s->idle_conns);
 			free(s->priv_conns);
 			free(s->safe_conns);
+			free(s->idle_orphan_conns);
+			free(s->curr_idle_thr);
 
 			if (s->use_ssl || s->check.use_ssl) {
 				if (xprt_get(XPRT_SSL) && xprt_get(XPRT_SSL)->destroy_srv)
@@ -2255,11 +2428,12 @@ void deinit(void)
 
 		free_http_req_rules(&p->http_req_rules);
 		free_http_res_rules(&p->http_res_rules);
-		task_free(p->task);
+		task_destroy(p->task);
 
 		pool_destroy(p->req_cap_pool);
 		pool_destroy(p->rsp_cap_pool);
-		pool_destroy(p->table.pool);
+		if (p->table)
+			pool_destroy(p->table->pool);
 
 		p0 = p;
 		p = p->next;
@@ -2288,7 +2462,6 @@ void deinit(void)
 	cfg_unregister_sections();
 
 	deinit_log_buffers();
-	deinit_trash_buffers();
 
 	protocol_unbind_all();
 
@@ -2302,7 +2475,9 @@ void deinit(void)
 	free(global.node);    global.node = NULL;
 	free(global.desc);    global.desc = NULL;
 	free(oldpids);        oldpids = NULL;
-	task_free(global_listener_queue_task); global_listener_queue_task = NULL;
+	task_destroy(global_listener_queue_task); global_listener_queue_task = NULL;
+	task_destroy(idle_conn_task);
+	idle_conn_task = NULL;
 
 	list_for_each_entry_safe(log, logb, &global.logsrvs, list) {
 			LIST_DEL(&log->list);
@@ -2322,93 +2497,15 @@ void deinit(void)
 	}
 
 	vars_prune(&global.vars, NULL, NULL);
-
-	deinit_buffer();
-
-	pool_destroy(pool_head_stream);
-	pool_destroy(pool_head_session);
-	pool_destroy(pool_head_connection);
-	pool_destroy(pool_head_connstream);
-	pool_destroy(pool_head_requri);
-	pool_destroy(pool_head_task);
-	pool_destroy(pool_head_capture);
-	pool_destroy(pool_head_pendconn);
-	pool_destroy(pool_head_sig_handlers);
-	pool_destroy(pool_head_hdr_idx);
-	pool_destroy(pool_head_http_txn);
+	pool_destroy_all();
 	deinit_pollers();
 } /* end deinit() */
 
-void mworker_pipe_handler(int fd)
-{
-	char c;
-
-	while (read(fd, &c, 1) == -1) {
-		if (errno == EINTR)
-			continue;
-		if (errno == EAGAIN) {
-			fd_cant_recv(fd);
-			return;
-		}
-		break;
-	}
-
-	/* At this step the master is down before
-	 * this worker perform a 'normal' exit.
-	 * So we want to exit with an error but
-	 * other threads could currently process
-	 * some stuff so we can't perform a clean
-	 * deinit().
-	 */
-	exit(EXIT_FAILURE);
-	return;
-}
-
-/* should only be called once per process */
-void mworker_pipe_register()
-{
-	if (fdtab[mworker_pipe[0]].owner)
-		/* already initialized */
-		return;
-
-	fcntl(mworker_pipe[0], F_SETFL, O_NONBLOCK);
-	fdtab[mworker_pipe[0]].owner = mworker_pipe;
-	fdtab[mworker_pipe[0]].iocb = mworker_pipe_handler;
-	/* In multi-tread, we need only one thread to process
-	 * events on the pipe with master
-	 */
-	fd_insert(mworker_pipe[0], 1);
-	fd_want_recv(mworker_pipe[0]);
-}
-
-static int sync_poll_loop()
-{
-	int stop = 0;
-
-	if (THREAD_NO_SYNC())
-		return stop;
-
-	THREAD_ENTER_SYNC();
-
-	if (!THREAD_NEED_SYNC())
-		goto exit;
-
-	/* *** { */
-	/* Put here all sync functions */
-
-	servers_update_status(); /* Commit server status changes */
-
-	/* *** } */
-  exit:
-	stop = (jobs == 0); /* stop when there's nothing left to do */
-	THREAD_EXIT_SYNC();
-	return stop;
-}
 
 /* Runs the polling loop */
 static void run_poll_loop()
 {
-	int next, exp;
+	int next, wake;
 
 	tv_update_date(0,1);
 	while (1) {
@@ -2423,33 +2520,37 @@ static void run_poll_loop()
 		/* Check if we can expire some tasks */
 		next = wake_expired_tasks();
 
-		/* the first thread requests a synchronization to exit when
-		 * there is no active jobs anymore */
-		if (tid == 0 && jobs == 0)
-			THREAD_WANT_SYNC();
+		/* stop when there's nothing left to do */
+		if ((jobs - unstoppable_jobs) == 0)
+			break;
+
+		/* also stop  if we failed to cleanly stop all tasks */
+		if (killed > 1)
+			break;
 
 		/* expire immediately if events are pending */
-		exp = now_ms;
+		wake = 1;
 		if (fd_cache_mask & tid_bit)
 			activity[tid].wake_cache++;
-		else if (active_tasks_mask & tid_bit)
+		else if (thread_has_tasks())
 			activity[tid].wake_tasks++;
-		else if (active_applets_mask & tid_bit)
-			activity[tid].wake_applets++;
 		else if (signal_queue_len && tid == 0)
 			activity[tid].wake_signal++;
-		else
-			exp = next;
+		else {
+			_HA_ATOMIC_OR(&sleeping_thread_mask, tid_bit);
+			__ha_barrier_atomic_store();
+			if (global_tasks_mask & tid_bit) {
+				activity[tid].wake_tasks++;
+				_HA_ATOMIC_AND(&sleeping_thread_mask, ~tid_bit);
+			} else
+				wake = 0;
+		}
 
 		/* The poller will ensure it returns around <next> */
-		cur_poller.poll(&cur_poller, exp);
+		cur_poller.poll(&cur_poller, next, wake);
+		if (sleeping_thread_mask & tid_bit)
+			_HA_ATOMIC_AND(&sleeping_thread_mask, ~tid_bit);
 		fd_process_cached_events();
-		applet_run_active();
-
-
-		/* Synchronize all polling loops */
-		if (sync_poll_loop())
-			break;
 
 		activity[tid].loops++;
 	}
@@ -2457,13 +2558,54 @@ static void run_poll_loop()
 
 static void *run_thread_poll_loop(void *data)
 {
+	struct per_thread_alloc_fct  *ptaf;
 	struct per_thread_init_fct   *ptif;
 	struct per_thread_deinit_fct *ptdf;
-	__decl_hathreads(static HA_SPINLOCK_T start_lock);
+	struct per_thread_free_fct   *ptff;
+	static int init_left = 0;
+	__decl_hathreads(static pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER);
+	__decl_hathreads(static pthread_cond_t  init_cond  = PTHREAD_COND_INITIALIZER);
 
-	ha_set_tid(*((unsigned int *)data));
+	ha_set_tid((unsigned long)data);
+
+#if (_POSIX_TIMERS > 0) && defined(_POSIX_THREAD_CPUTIME)
+#ifdef USE_THREAD
+	pthread_getcpuclockid(pthread_self(), &ti->clock_id);
+#else
+	ti->clock_id = CLOCK_THREAD_CPUTIME_ID;
+#endif
+#endif
+	/* Now, initialize one thread init at a time. This is better since
+	 * some init code is a bit tricky and may release global resources
+	 * after reallocating them locally. This will also ensure there is
+	 * no race on file descriptors allocation.
+	 */
+#ifdef USE_THREAD
+	pthread_mutex_lock(&init_mutex);
+#endif
+	/* The first thread must set the number of threads left */
+	if (!init_left)
+		init_left = global.nbthread;
+	init_left--;
+
 	tv_update_date(-1,-1);
 
+	/* per-thread alloc calls performed here are not allowed to snoop on
+	 * other threads, so they are free to initialize at their own rhythm
+	 * as long as they act as if they were alone. None of them may rely
+	 * on resources initialized by the other ones.
+	 */
+	list_for_each_entry(ptaf, &per_thread_alloc_list, list) {
+		if (!ptaf->fct()) {
+			ha_alert("failed to allocate resources for thread %u.\n", tid);
+			exit(1);
+		}
+	}
+
+	/* per-thread init calls performed here are not allowed to snoop on
+	 * other threads, so they are free to initialize at their own rhythm
+	 * as long as they act as if they were alone.
+	 */
 	list_for_each_entry(ptif, &per_thread_init_list, list) {
 		if (!ptif->fct()) {
 			ha_alert("failed to initialize thread %u.\n", tid);
@@ -2471,21 +2613,34 @@ static void *run_thread_poll_loop(void *data)
 		}
 	}
 
-	if (global.mode & MODE_MWORKER) {
-		HA_SPIN_LOCK(START_LOCK, &start_lock);
-		mworker_pipe_register();
-		HA_SPIN_UNLOCK(START_LOCK, &start_lock);
-	}
+	/* enabling protocols will result in fd_insert() calls to be performed,
+	 * we want all threads to have already allocated their local fd tables
+	 * before doing so, thus only the last thread does it.
+	 */
+	if (init_left == 0)
+		protocol_enable_all();
 
-	protocol_enable_all();
-	THREAD_SYNC_ENABLE();
+#ifdef USE_THREAD
+	pthread_cond_broadcast(&init_cond);
+	pthread_mutex_unlock(&init_mutex);
+
+	/* now wait for other threads to finish starting */
+	pthread_mutex_lock(&init_mutex);
+	while (init_left)
+		pthread_cond_wait(&init_cond, &init_mutex);
+	pthread_mutex_unlock(&init_mutex);
+#endif
+
 	run_poll_loop();
 
 	list_for_each_entry(ptdf, &per_thread_deinit_list, list)
 		ptdf->fct();
 
+	list_for_each_entry(ptff, &per_thread_free_list, list)
+		ptff->fct();
+
 #ifdef USE_THREAD
-	HA_ATOMIC_AND(&all_threads_mask, ~tid_bit);
+	_HA_ATOMIC_AND(&all_threads_mask, ~tid_bit);
 	if (tid > 0)
 		pthread_exit(NULL);
 #endif
@@ -2496,7 +2651,7 @@ static void *run_thread_poll_loop(void *data)
  * for global resources when there are enough free resource, or at least once in
  * a while. It is designed to be called as a task.
  */
-static struct task *manage_global_listener_queue(struct task *t)
+static struct task *manage_global_listener_queue(struct task *t, void *context, unsigned short state)
 {
 	int next = TICK_ETERNITY;
 	/* queue is empty, nothing to do */
@@ -2531,6 +2686,31 @@ int main(int argc, char **argv)
 	char errmsg[100];
 	int pidfd = -1;
 
+	setvbuf(stdout, NULL, _IONBF, 0);
+
+	/* this can only safely be done here, though it's optimized away by
+	 * the compiler.
+	 */
+	if (MAX_PROCS < 1 || MAX_PROCS > LONGBITS) {
+		ha_alert("MAX_PROCS value must be between 1 and %d inclusive; "
+		         "HAProxy was built with value %d, please fix it and rebuild.\n",
+			 LONGBITS, MAX_PROCS);
+		exit(1);
+	}
+
+	/* take a copy of initial limits before we possibly change them */
+	getrlimit(RLIMIT_NOFILE, &limit);
+	rlim_fd_cur_at_boot = limit.rlim_cur;
+	rlim_fd_max_at_boot = limit.rlim_max;
+
+	/* process all initcalls in order of potential dependency */
+	RUN_INITCALLS(STG_PREPARE);
+	RUN_INITCALLS(STG_LOCK);
+	RUN_INITCALLS(STG_ALLOC);
+	RUN_INITCALLS(STG_POOL);
+	RUN_INITCALLS(STG_REGISTER);
+	RUN_INITCALLS(STG_INIT);
+
 	init(argc, argv);
 	signal_register_fct(SIGQUIT, dump, SIGQUIT);
 	signal_register_fct(SIGUSR1, sig_soft_stop, SIGUSR1);
@@ -2548,7 +2728,9 @@ int main(int argc, char **argv)
 		global.rlimit_nofile = global.maxsock;
 
 	if (global.rlimit_nofile) {
-		limit.rlim_cur = limit.rlim_max = global.rlimit_nofile;
+		limit.rlim_cur = global.rlimit_nofile;
+		limit.rlim_max = MAX(rlim_fd_max_at_boot, limit.rlim_cur);
+
 		if (setrlimit(RLIMIT_NOFILE, &limit) == -1) {
 			/* try to set it to the max possible at least */
 			getrlimit(RLIMIT_NOFILE, &limit);
@@ -2628,7 +2810,7 @@ int main(int argc, char **argv)
 		exit(1);
 	}
 
-	if (listeners == 0) {
+	if (!(global.mode & MODE_MWORKER_WAIT) && listeners == 0) {
 		ha_alert("[%s.main()] No enabled listener found (check for 'bind' directives) ! Exiting.\n", argv[0]);
 		/* Note: we don't have to send anything to the old pids because we
 		 * never stopped them. */
@@ -2722,8 +2904,12 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (nb_oldpids)
+	if (nb_oldpids && !(global.mode & MODE_MWORKER_WAIT))
 		nb_oldpids = tell_old_pids(oldpids_sig);
+
+	/* send a SIGTERM to workers who have a too high reloads number  */
+	if ((global.mode & MODE_MWORKER) && !(global.mode & MODE_MWORKER_WAIT))
+		mworker_kill_max_reloads(SIGTERM);
 
 	if ((getenv("HAPROXY_MWORKER_REEXEC") == NULL)) {
 		nb_oldpids = 0;
@@ -2756,6 +2942,32 @@ int main(int argc, char **argv)
 			exit(1);
 		}
 	}
+
+	/* try our best to re-enable core dumps depending on system capabilities.
+	 * What is addressed here :
+	 *   - remove file size limits
+	 *   - remove core size limits
+	 *   - mark the process dumpable again if it lost it due to user/group
+	 */
+	if (global.tune.options & GTUNE_SET_DUMPABLE) {
+		limit.rlim_cur = limit.rlim_max = RLIM_INFINITY;
+
+#if defined(RLIMIT_FSIZE)
+		if (setrlimit(RLIMIT_FSIZE, &limit) == -1)
+			ha_warning("[%s.main()] Failed to set the raise the maximum file size.\n", argv[0]);
+#endif
+
+#if defined(RLIMIT_CORE)
+		if (setrlimit(RLIMIT_CORE, &limit) == -1)
+			ha_warning("[%s.main()] Failed to set the raise the core dump size.\n", argv[0]);
+#endif
+
+#if defined(USE_PRCTL)
+		if (prctl(PR_SET_DUMPABLE, 1, 0, 0, 0) == -1)
+			ha_warning("[%s.main()] Failed to set the dumpable flag, no core will be dumped.\n", argv[0]);
+#endif
+	}
+
 	/* check ulimits */
 	limit.rlim_cur = limit.rlim_max = 0;
 	getrlimit(RLIMIT_NOFILE, &limit);
@@ -2764,14 +2976,13 @@ int main(int argc, char **argv)
 			   argv[0], (int)limit.rlim_cur, global.maxconn, global.maxsock, global.maxsock);
 	}
 
-	if (global.mode & (MODE_DAEMON | MODE_MWORKER)) {
+	if (global.mode & (MODE_DAEMON | MODE_MWORKER | MODE_MWORKER_WAIT)) {
 		struct proxy *px;
 		struct peers *curpeers;
 		int ret = 0;
 		int proc;
 		int devnullfd = -1;
 
-		children = calloc(global.nbproc, sizeof(int));
 		/*
 		 * if daemon + mworker: must fork here to let a master
 		 * process live in background before forking children
@@ -2785,39 +2996,12 @@ int main(int argc, char **argv)
 				ha_alert("[%s.main()] Cannot fork.\n", argv[0]);
 				protocol_unbind_all();
 				exit(1); /* there has been an error */
-			}
-			/* parent leave to daemonize */
-			if (ret > 0)
+			} else if (ret > 0) { /* parent leave to daemonize */
 				exit(0);
+			} else /* change the process group ID in the child (master process) */
+				setsid();
 		}
 
-		if (global.mode & MODE_MWORKER) {
-			if ((getenv("HAPROXY_MWORKER_REEXEC") == NULL)) {
-				char *msg = NULL;
-				/* master pipe to ensure the master is still alive  */
-				ret = pipe(mworker_pipe);
-				if (ret < 0) {
-					ha_alert("[%s.main()] Cannot create master pipe.\n", argv[0]);
-					exit(EXIT_FAILURE);
-				} else {
-					memprintf(&msg, "%d", mworker_pipe[0]);
-					setenv("HAPROXY_MWORKER_PIPE_RD", msg, 1);
-					memprintf(&msg, "%d", mworker_pipe[1]);
-					setenv("HAPROXY_MWORKER_PIPE_WR", msg, 1);
-					free(msg);
-				}
-			} else {
-				char* rd = getenv("HAPROXY_MWORKER_PIPE_RD");
-				char* wr = getenv("HAPROXY_MWORKER_PIPE_WR");
-				if (!rd || !wr) {
-					ha_alert("[%s.main()] Cannot get master pipe FDs.\n", argv[0]);
-					atexit_flag = 0;// dont reexecute master process
-					exit(EXIT_FAILURE);
-				}
-				mworker_pipe[0] = atoi(rd);
-				mworker_pipe[1] = atoi(wr);
-			}
-		}
 
 		/* if in master-worker mode, write the PID of the father */
 		if (global.mode & MODE_MWORKER) {
@@ -2828,28 +3012,51 @@ int main(int argc, char **argv)
 		}
 
 		/* the father launches the required number of processes */
-		for (proc = 0; proc < global.nbproc; proc++) {
-			ret = fork();
-			if (ret < 0) {
-				ha_alert("[%s.main()] Cannot fork.\n", argv[0]);
-				protocol_unbind_all();
-				exit(1); /* there has been an error */
+		if (!(global.mode & MODE_MWORKER_WAIT)) {
+			if (global.mode & MODE_MWORKER)
+				mworker_ext_launch_all();
+			for (proc = 0; proc < global.nbproc; proc++) {
+				ret = fork();
+				if (ret < 0) {
+					ha_alert("[%s.main()] Cannot fork.\n", argv[0]);
+					protocol_unbind_all();
+					exit(1); /* there has been an error */
+				}
+				else if (ret == 0) /* child breaks here */
+					break;
+				if (pidfd >= 0 && !(global.mode & MODE_MWORKER)) {
+					char pidstr[100];
+					snprintf(pidstr, sizeof(pidstr), "%d\n", ret);
+					shut_your_big_mouth_gcc(write(pidfd, pidstr, strlen(pidstr)));
+				}
+				if (global.mode & MODE_MWORKER) {
+					struct mworker_proc *child;
+
+					ha_notice("New worker #%d (%d) forked\n", relative_pid, ret);
+					/* find the right mworker_proc */
+					list_for_each_entry(child, &proc_list, list) {
+						if (child->relative_pid == relative_pid &&
+						    child->reloads == 0 && child->options & PROC_O_TYPE_WORKER) {
+							child->timestamp = now.tv_sec;
+							child->pid = ret;
+							child->version = strdup(haproxy_version);
+							break;
+						}
+					}
+				}
+
+				relative_pid++; /* each child will get a different one */
+				pid_bit <<= 1;
 			}
-			else if (ret == 0) /* child breaks here */
-				break;
-			children[proc] = ret;
-			if (pidfd >= 0 && !(global.mode & MODE_MWORKER)) {
-				char pidstr[100];
-				snprintf(pidstr, sizeof(pidstr), "%d\n", ret);
-				shut_your_big_mouth_gcc(write(pidfd, pidstr, strlen(pidstr)));
-			}
-			relative_pid++; /* each child will get a different one */
-			pid_bit <<= 1;
+		} else {
+			/* wait mode */
+			global.nbproc = 1;
+			proc = 1;
 		}
 
 #ifdef USE_CPU_AFFINITY
 		if (proc < global.nbproc &&  /* child */
-		    proc < LONGBITS &&       /* only the first 32/64 processes may be pinned */
+		    proc < MAX_PROCS &&       /* only the first 32/64 processes may be pinned */
 		    global.cpu_map.proc[proc])    /* only do this if the process has a CPU map */
 #ifdef __FreeBSD__
 		{
@@ -2878,9 +3085,7 @@ int main(int argc, char **argv)
 		free(global.pidfile); global.pidfile = NULL;
 
 		if (proc == global.nbproc) {
-			if (global.mode & MODE_MWORKER) {
-				mworker_cleanlisteners();
-				deinit_pollers();
+			if (global.mode & (MODE_MWORKER|MODE_MWORKER_WAIT)) {
 
 				if ((!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) &&
 					(global.mode & MODE_DAEMON)) {
@@ -2890,10 +3095,9 @@ int main(int argc, char **argv)
 
 					global.mode &= ~MODE_VERBOSE;
 					global.mode |= MODE_QUIET; /* ensure that we won't say anything from now */
-					setsid();
 				}
 
-				mworker_wait();
+				mworker_loop();
 				/* should never get there */
 				exit(EXIT_FAILURE);
 			}
@@ -2906,9 +3110,32 @@ int main(int argc, char **argv)
 		/* child must never use the atexit function */
 		atexit_flag = 0;
 
-		/* close the write end of the master pipe in the children */
-		if (global.mode & MODE_MWORKER)
-			close(mworker_pipe[1]);
+		/* close useless master sockets */
+		if (global.mode & MODE_MWORKER) {
+			struct mworker_proc *child, *it;
+			master = 0;
+
+			mworker_cli_proxy_stop();
+
+			/* free proc struct of other processes  */
+			list_for_each_entry_safe(child, it, &proc_list, list) {
+				/* close the FD of the master side for all
+				 * workers, we don't need to close the worker
+				 * side of other workers since it's done with
+				 * the bind_proc */
+				if (child->ipc_fd[0] >= 0)
+					close(child->ipc_fd[0]);
+				if (child->relative_pid == relative_pid &&
+				    child->reloads == 0) {
+					/* keep this struct if this is our pid */
+					proc_self = child;
+					continue;
+				}
+				LIST_DEL(&child->list);
+				mworker_free_child(child);
+				child = NULL;
+			}
+		}
 
 		if (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) {
 			devnullfd = open("/dev/null", O_RDWR, 0);
@@ -2995,27 +3222,31 @@ int main(int argc, char **argv)
 			stop_proxy(curpeers->peers_fe);
 			/* disable this peer section so that it kills itself */
 			signal_unregister_handler(curpeers->sighandler);
-			task_delete(curpeers->sync_task);
-			task_free(curpeers->sync_task);
+			task_destroy(curpeers->sync_task);
 			curpeers->sync_task = NULL;
-			task_free(curpeers->peers_fe->task);
+			task_destroy(curpeers->peers_fe->task);
 			curpeers->peers_fe->task = NULL;
 			curpeers->peers_fe = NULL;
 		}
 
-		/* if we're NOT in QUIET mode, we should now close the 3 first FDs to ensure
-		 * that we can detach from the TTY. We MUST NOT do it in other cases since
-		 * it would have already be done, and 0-2 would have been affected to listening
-		 * sockets
+		/*
+		 * This is only done in daemon mode because we might want the
+		 * logs on stdout in mworker mode. If we're NOT in QUIET mode,
+		 * we should now close the 3 first FDs to ensure that we can
+		 * detach from the TTY. We MUST NOT do it in other cases since
+		 * it would have already be done, and 0-2 would have been
+		 * affected to listening sockets
 		 */
-		if (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE)) {
+		if ((global.mode & MODE_DAEMON) &&
+		    (!(global.mode & MODE_QUIET) || (global.mode & MODE_VERBOSE))) {
 			/* detach from the tty */
 			stdio_quiet(devnullfd);
 			global.mode &= ~MODE_VERBOSE;
 			global.mode |= MODE_QUIET; /* ensure that we won't say anything from now */
 		}
 		pid = getpid(); /* update child's pid */
-		setsid();
+		if (!(global.mode & MODE_MWORKER)) /* in mworker mode we don't want a new pgid for the children */
+			setsid();
 		fork_poller();
 	}
 
@@ -3025,16 +3256,8 @@ int main(int argc, char **argv)
 	 */
 #ifdef USE_THREAD
 	{
-		unsigned int *tids    = calloc(global.nbthread, sizeof(unsigned int));
-		pthread_t    *threads = calloc(global.nbthread, sizeof(pthread_t));
-		int          i;
 		sigset_t     blocked_sig, old_sig;
-
-		THREAD_SYNC_INIT();
-
-		/* Init tids array */
-		for (i = 0; i < global.nbthread; i++)
-			tids[i] = i;
+		int          i;
 
 		/* ensure the signals will be blocked in every thread */
 		sigfillset(&blocked_sig);
@@ -3046,25 +3269,25 @@ int main(int argc, char **argv)
 		pthread_sigmask(SIG_SETMASK, &blocked_sig, &old_sig);
 
 		/* Create nbthread-1 thread. The first thread is the current process */
-		threads[0] = pthread_self();
+		thread_info[0].pthread = pthread_self();
 		for (i = 1; i < global.nbthread; i++)
-			pthread_create(&threads[i], NULL, &run_thread_poll_loop, &tids[i]);
+			pthread_create(&thread_info[i].pthread, NULL, &run_thread_poll_loop, (void *)(long)i);
 
 #ifdef USE_CPU_AFFINITY
 		/* Now the CPU affinity for all threads */
 		for (i = 0; i < global.nbthread; i++) {
 			if (global.cpu_map.proc[relative_pid-1])
-				global.cpu_map.thread[relative_pid-1][i] &= global.cpu_map.proc[relative_pid-1];
+				global.cpu_map.thread[i] &= global.cpu_map.proc[relative_pid-1];
 
 			if (i < MAX_THREADS &&       /* only the first 32/64 threads may be pinned */
-			    global.cpu_map.thread[relative_pid-1][i]) {/* only do this if the thread has a THREAD map */
+			    global.cpu_map.thread[i]) {/* only do this if the thread has a THREAD map */
 #if defined(__FreeBSD__) || defined(__NetBSD__)
 				cpuset_t cpuset;
 #else
 				cpu_set_t cpuset;
 #endif
 				int j;
-				unsigned long cpu_map = global.cpu_map.thread[relative_pid-1][i];
+				unsigned long cpu_map = global.cpu_map.thread[i];
 
 				CPU_ZERO(&cpuset);
 
@@ -3072,33 +3295,29 @@ int main(int argc, char **argv)
 					CPU_SET(j - 1, &cpuset);
 					cpu_map &= ~(1UL << (j - 1));
 				}
-				pthread_setaffinity_np(threads[i],
+				pthread_setaffinity_np(thread_info[i].pthread,
 						       sizeof(cpuset), &cpuset);
 			}
 		}
 #endif /* !USE_CPU_AFFINITY */
 
 		/* when multithreading we need to let only the thread 0 handle the signals */
-		pthread_sigmask(SIG_SETMASK, &old_sig, NULL);
+		haproxy_unblock_signals();
 
 		/* Finally, start the poll loop for the first thread */
-		run_thread_poll_loop(&tids[0]);
+		run_thread_poll_loop(0);
 
 		/* Wait the end of other threads */
 		for (i = 1; i < global.nbthread; i++)
-			pthread_join(threads[i], NULL);
-
-		free(tids);
-		free(threads);
+			pthread_join(thread_info[i].pthread, NULL);
 
 #if defined(DEBUG_THREAD) || defined(DEBUG_FULL)
 		show_lock_stats();
 #endif
 	}
 #else /* ! USE_THREAD */
-
-	run_thread_poll_loop((int []){0});
-
+	haproxy_unblock_signals();
+	run_thread_poll_loop(0);
 #endif
 
 	/* Do some cleanup */

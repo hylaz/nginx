@@ -6,10 +6,13 @@
 #include <lua.h>
 #include <lauxlib.h>
 
+#include <common/regex.h>
 #include <common/xref.h>
 
+#include <types/proto_http.h>
 #include <types/proxy.h>
 #include <types/server.h>
+#include <types/stick_table.h>
 
 #define CLASS_CORE         "Core"
 #define CLASS_TXN          "TXN"
@@ -25,6 +28,7 @@
 #define CLASS_SERVER       "Server"
 #define CLASS_LISTENER     "Listener"
 #define CLASS_REGEX        "Regex"
+#define CLASS_STKTABLE     "StickTable"
 
 struct stream;
 
@@ -47,6 +51,9 @@ enum hlua_exec {
 	HLUA_E_OK = 0,
 	HLUA_E_AGAIN,  /* LUA yield, must resume the stack execution later, when
 	                  the associatedtask is waked. */
+	HLUA_E_ETMOUT, /* Execution timeout */
+	HLUA_E_NOMEM,  /* Out of memory error */
+	HLUA_E_YIELD,  /* LUA code try to yield, and this is not allowed */
 	HLUA_E_ERRMSG, /* LUA stack execution failed with a string error message
 	                  in the top of stack. */
 	HLUA_E_ERR,    /* LUA stack execution failed without error message. */

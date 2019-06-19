@@ -1,11 +1,14 @@
 #include <ctype.h>
 
 #include <common/cfgparse.h>
+#include <common/http.h>
+#include <common/initcall.h>
 #include <common/mini-clist.h>
 
 #include <types/vars.h>
 
 #include <proto/arg.h>
+#include <proto/http_rules.h>
 #include <proto/proto_http.h>
 #include <proto/sample.h>
 #include <proto/stream.h>
@@ -13,7 +16,7 @@
 #include <proto/vars.h>
 
 /* This contains a pool of struct vars */
-static struct pool_head *var_pool = NULL;
+DECLARE_STATIC_POOL(var_pool, "vars", sizeof(struct var));
 
 /* This array contain all the names of all the HAProxy vars.
  * This permits to identify two variables name with
@@ -31,8 +34,26 @@ static unsigned int var_sess_limit = 0;
 static unsigned int var_txn_limit = 0;
 static unsigned int var_reqres_limit = 0;
 
+__decl_rwlock(var_names_rwlock);
 
-__decl_hathreads(HA_RWLOCK_T var_names_rwlock);
+/* returns the struct vars pointer for a session, stream and scope, or NULL if
+ * it does not exist.
+ */
+static inline struct vars *get_vars(struct session *sess, struct stream *strm, enum vars_scope scope)
+{
+	switch (scope) {
+	case SCOPE_PROC:
+		return &global.vars;
+	case SCOPE_SESS:
+		return &sess->vars;
+	case SCOPE_TXN:
+		return strm ? &strm->vars_txn : NULL;
+	case SCOPE_REQ:
+	case SCOPE_RES:
+	default:
+		return strm ? &strm->vars_reqres : NULL;
+	}
+}
 
 /* This function adds or remove memory size from the accounting. The inner
  * pointers may be null when setting the outer ones only.
@@ -42,22 +63,24 @@ static void var_accounting_diff(struct vars *vars, struct session *sess, struct 
 	switch (vars->scope) {
 	case SCOPE_REQ:
 	case SCOPE_RES:
-		HA_ATOMIC_ADD(&strm->vars_reqres.size, size);
+		if (strm)
+			_HA_ATOMIC_ADD(&strm->vars_reqres.size, size);
 		/* fall through */
 	case SCOPE_TXN:
-		HA_ATOMIC_ADD(&strm->vars_txn.size, size);
+		if (strm)
+			_HA_ATOMIC_ADD(&strm->vars_txn.size, size);
 		/* fall through */
 	case SCOPE_SESS:
-		HA_ATOMIC_ADD(&sess->vars.size, size);
+		_HA_ATOMIC_ADD(&sess->vars.size, size);
 		/* fall through */
 	case SCOPE_PROC:
-		HA_ATOMIC_ADD(&global.vars.size, size);
-		HA_ATOMIC_ADD(&var_global_size, size);
+		_HA_ATOMIC_ADD(&global.vars.size, size);
+		_HA_ATOMIC_ADD(&var_global_size, size);
 	}
 }
 
 /* This function returns 1 if the <size> is available in the var
- * pool <vars>, otherwise returns 0. If the space is avalaible,
+ * pool <vars>, otherwise returns 0. If the space is available,
  * the size is reserved. The inner pointers may be null when setting
  * the outer ones only. The accounting uses either <sess> or <strm>
  * depending on the scope. <strm> may be NULL when no stream is known
@@ -68,11 +91,11 @@ static int var_accounting_add(struct vars *vars, struct session *sess, struct st
 	switch (vars->scope) {
 	case SCOPE_REQ:
 	case SCOPE_RES:
-		if (var_reqres_limit && strm->vars_reqres.size + size > var_reqres_limit)
+		if (var_reqres_limit && strm && strm->vars_reqres.size + size > var_reqres_limit)
 			return 0;
 		/* fall through */
 	case SCOPE_TXN:
-		if (var_txn_limit && strm->vars_txn.size + size > var_txn_limit)
+		if (var_txn_limit && strm && strm->vars_txn.size + size > var_txn_limit)
 			return 0;
 		/* fall through */
 	case SCOPE_SESS:
@@ -95,12 +118,12 @@ unsigned int var_clear(struct var *var)
 	unsigned int size = 0;
 
 	if (var->data.type == SMP_T_STR || var->data.type == SMP_T_BIN) {
-		free(var->data.u.str.str);
-		size += var->data.u.str.len;
+		free(var->data.u.str.area);
+		size += var->data.u.str.data;
 	}
 	else if (var->data.type == SMP_T_METH && var->data.u.meth.meth == HTTP_METH_OTHER) {
-		free(var->data.u.meth.str.str);
-		size += var->data.u.meth.str.len;
+		free(var->data.u.meth.str.area);
+		size += var->data.u.meth.str.data;
 	}
 	LIST_DEL(&var->l);
 	pool_free(var_pool, var);
@@ -108,7 +131,7 @@ unsigned int var_clear(struct var *var)
 	return size;
 }
 
-/* This function free all the memory used by all the varaibles
+/* This function free all the memory used by all the variables
  * in the list.
  */
 void vars_prune(struct vars *vars, struct session *sess, struct stream *strm)
@@ -138,9 +161,9 @@ void vars_prune_per_sess(struct vars *vars)
 	}
 	HA_RWLOCK_WRUNLOCK(VARS_LOCK, &vars->rwlock);
 
-	HA_ATOMIC_SUB(&vars->size, size);
-	HA_ATOMIC_SUB(&global.vars.size, size);
-	HA_ATOMIC_SUB(&var_global_size, size);
+	_HA_ATOMIC_SUB(&vars->size, size);
+	_HA_ATOMIC_SUB(&global.vars.size, size);
+	_HA_ATOMIC_SUB(&var_global_size, size);
 }
 
 /* This function init a list of variabes. */
@@ -285,27 +308,8 @@ static int smp_fetch_var(const struct arg *args, struct sample *smp, const char 
 	struct vars *vars;
 
 	/* Check the availibity of the variable. */
-	switch (var_desc->scope) {
-	case SCOPE_PROC:
-		vars = &global.vars;
-		break;
-	case SCOPE_SESS:
-		vars = &smp->sess->vars;
-		break;
-	case SCOPE_TXN:
-		if (!smp->strm)
-			return 0;
-		vars = &smp->strm->vars_txn;
-		break;
-	case SCOPE_REQ:
-	case SCOPE_RES:
-	default:
-		if (!smp->strm)
-			return 0;
-		vars = &smp->strm->vars_reqres;
-		break;
-	}
-	if (vars->scope != var_desc->scope)
+	vars = get_vars(smp->sess, smp->strm, var_desc->scope);
+	if (!vars || vars->scope != var_desc->scope)
 		return 0;
 
 	HA_RWLOCK_RDLOCK(VARS_LOCK, &vars->rwlock);
@@ -343,16 +347,18 @@ static int sample_store(struct vars *vars, const char *name, struct sample *smp)
 		/* free its used memory. */
 		if (var->data.type == SMP_T_STR ||
 		    var->data.type == SMP_T_BIN) {
-			free(var->data.u.str.str);
-			var_accounting_diff(vars, smp->sess, smp->strm, -var->data.u.str.len);
+			free(var->data.u.str.area);
+			var_accounting_diff(vars, smp->sess, smp->strm,
+					    -var->data.u.str.data);
 		}
 		else if (var->data.type == SMP_T_METH && var->data.u.meth.meth == HTTP_METH_OTHER) {
-			free(var->data.u.meth.str.str);
-			var_accounting_diff(vars, smp->sess, smp->strm, -var->data.u.meth.str.len);
+			free(var->data.u.meth.str.area);
+			var_accounting_diff(vars, smp->sess, smp->strm,
+					    -var->data.u.meth.str.data);
 		}
 	} else {
 
-		/* Check memory avalaible. */
+		/* Check memory available. */
 		if (!var_accounting_add(vars, smp->sess, smp->strm, sizeof(struct var)))
 			return 0;
 
@@ -381,37 +387,41 @@ static int sample_store(struct vars *vars, const char *name, struct sample *smp)
 		break;
 	case SMP_T_STR:
 	case SMP_T_BIN:
-		if (!var_accounting_add(vars, smp->sess, smp->strm, smp->data.u.str.len)) {
+		if (!var_accounting_add(vars, smp->sess, smp->strm, smp->data.u.str.data)) {
 			var->data.type = SMP_T_BOOL; /* This type doesn't use additional memory. */
 			return 0;
 		}
-		var->data.u.str.str = malloc(smp->data.u.str.len);
-		if (!var->data.u.str.str) {
-			var_accounting_diff(vars, smp->sess, smp->strm, -smp->data.u.str.len);
+		var->data.u.str.area = malloc(smp->data.u.str.data);
+		if (!var->data.u.str.area) {
+			var_accounting_diff(vars, smp->sess, smp->strm,
+					    -smp->data.u.str.data);
 			var->data.type = SMP_T_BOOL; /* This type doesn't use additional memory. */
 			return 0;
 		}
-		var->data.u.str.len = smp->data.u.str.len;
-		memcpy(var->data.u.str.str, smp->data.u.str.str, var->data.u.str.len);
+		var->data.u.str.data = smp->data.u.str.data;
+		memcpy(var->data.u.str.area, smp->data.u.str.area,
+		       var->data.u.str.data);
 		break;
 	case SMP_T_METH:
 		var->data.u.meth.meth = smp->data.u.meth.meth;
 		if (smp->data.u.meth.meth != HTTP_METH_OTHER)
 			break;
 
-		if (!var_accounting_add(vars, smp->sess, smp->strm, smp->data.u.meth.str.len)) {
+		if (!var_accounting_add(vars, smp->sess, smp->strm, smp->data.u.meth.str.data)) {
 			var->data.type = SMP_T_BOOL; /* This type doesn't use additional memory. */
 			return 0;
 		}
-		var->data.u.meth.str.str = malloc(smp->data.u.meth.str.len);
-		if (!var->data.u.meth.str.str) {
-			var_accounting_diff(vars, smp->sess, smp->strm, -smp->data.u.meth.str.len);
+		var->data.u.meth.str.area = malloc(smp->data.u.meth.str.data);
+		if (!var->data.u.meth.str.area) {
+			var_accounting_diff(vars, smp->sess, smp->strm,
+					    -smp->data.u.meth.str.data);
 			var->data.type = SMP_T_BOOL; /* This type doesn't use additional memory. */
 			return 0;
 		}
-		var->data.u.meth.str.len = smp->data.u.meth.str.len;
-		var->data.u.meth.str.size = smp->data.u.meth.str.len;
-		memcpy(var->data.u.meth.str.str, smp->data.u.meth.str.str, var->data.u.meth.str.len);
+		var->data.u.meth.str.data = smp->data.u.meth.str.data;
+		var->data.u.meth.str.size = smp->data.u.meth.str.data;
+		memcpy(var->data.u.meth.str.area, smp->data.u.meth.str.area,
+		       var->data.u.meth.str.data);
 		break;
 	}
 	return 1;
@@ -423,15 +433,8 @@ static inline int sample_store_stream(const char *name, enum vars_scope scope, s
 	struct vars *vars;
 	int ret;
 
-	switch (scope) {
-	case SCOPE_PROC: vars = &global.vars;  break;
-	case SCOPE_SESS: vars = &smp->sess->vars;  break;
-	case SCOPE_TXN:  vars = &smp->strm->vars_txn;    break;
-	case SCOPE_REQ:
-	case SCOPE_RES:
-	default:         vars = &smp->strm->vars_reqres; break;
-	}
-	if (vars->scope != scope)
+	vars = get_vars(smp->sess, smp->strm, scope);
+	if (!vars || vars->scope != scope)
 		return 0;
 
 	HA_RWLOCK_WRLOCK(VARS_LOCK, &vars->rwlock);
@@ -447,15 +450,8 @@ static inline int sample_clear_stream(const char *name, enum vars_scope scope, s
 	struct var  *var;
 	unsigned int size = 0;
 
-	switch (scope) {
-	case SCOPE_PROC: vars = &global.vars;  break;
-	case SCOPE_SESS: vars = &smp->sess->vars;  break;
-	case SCOPE_TXN:  vars = &smp->strm->vars_txn;    break;
-	case SCOPE_REQ:
-	case SCOPE_RES:
-	default:         vars = &smp->strm->vars_reqres; break;
-	}
-	if (vars->scope != scope)
+	vars = get_vars(smp->sess, smp->strm, scope);
+	if (!vars || vars->scope != scope)
 		return 0;
 
 	/* Look for existing variable name. */
@@ -481,9 +477,9 @@ static int smp_conv_clear(const struct arg *args, struct sample *smp, void *priv
 	return sample_clear_stream(args[0].data.var.name, args[0].data.var.scope, smp);
 }
 
-/* This fucntions check an argument entry and fill it with a variable
+/* This functions check an argument entry and fill it with a variable
  * type. The argumen must be a string. If the variable lookup fails,
- * the function retuns 0 and fill <err>, otherwise it returns 1.
+ * the function returns 0 and fill <err>, otherwise it returns 1.
  */
 int vars_check_arg(struct arg *arg, char **err)
 {
@@ -497,9 +493,14 @@ int vars_check_arg(struct arg *arg, char **err)
 	}
 
 	/* Register new variable name. */
-	name = register_name(arg->data.str.str, arg->data.str.len, &scope, 1, err);
+	name = register_name(arg->data.str.area, arg->data.str.data, &scope,
+			     1,
+			     err);
 	if (!name)
 		return 0;
+
+	/* properly destroy the chunk */
+	chunk_destroy(&arg->data.str);
 
 	/* Use the global variable name pointer. */
 	arg->type = ARGT_VAR;
@@ -586,17 +587,8 @@ int vars_get_by_name(const char *name, size_t len, struct sample *smp)
 		return 0;
 
 	/* Select "vars" pool according with the scope. */
-	switch (scope) {
-	case SCOPE_PROC: vars = &global.vars;  break;
-	case SCOPE_SESS: vars = &smp->sess->vars;  break;
-	case SCOPE_TXN:  vars = &smp->strm->vars_txn;    break;
-	case SCOPE_REQ:
-	case SCOPE_RES:
-	default:         vars = &smp->strm->vars_reqres; break;
-	}
-
-	/* Check if the scope is avalaible a this point of processing. */
-	if (vars->scope != scope)
+	vars = get_vars(smp->sess, smp->strm, scope);
+	if (!vars || vars->scope != scope)
 		return 0;
 
 	/* Get the variable entry. */
@@ -611,7 +603,7 @@ int vars_get_by_name(const char *name, size_t len, struct sample *smp)
 }
 
 /* this function fills a sample with the
- * content of the varaible described by <var_desc>. Returns 1
+ * content of the variable described by <var_desc>. Returns 1
  * if the sample is filled, otherwise it returns 0.
  */
 int vars_get_by_desc(const struct var_desc *var_desc, struct sample *smp)
@@ -620,17 +612,10 @@ int vars_get_by_desc(const struct var_desc *var_desc, struct sample *smp)
 	struct var *var;
 
 	/* Select "vars" pool according with the scope. */
-	switch (var_desc->scope) {
-	case SCOPE_PROC: vars = &global.vars;  break;
-	case SCOPE_SESS: vars = &smp->sess->vars;  break;
-	case SCOPE_TXN:  vars = &smp->strm->vars_txn;    break;
-	case SCOPE_REQ:
-	case SCOPE_RES:
-	default:         vars = &smp->strm->vars_reqres; break;
-	}
+	vars = get_vars(smp->sess, smp->strm, var_desc->scope);
 
-	/* Check if the scope is avalaible a this point of processing. */
-	if (vars->scope != var_desc->scope)
+	/* Check if the scope is available a this point of processing. */
+	if (!vars || vars->scope != var_desc->scope)
 		return 0;
 
 	/* Get the variable entry. */
@@ -712,6 +697,7 @@ static int conv_check_var(struct arg *args, struct sample_conv *conv,
  * the format:
  *
  *   set-var(<variable-name>) <expression>
+ *   unset-var(<variable-name>)
  *
  * It returns ACT_RET_PRS_ERR if fails and <err> is filled with an error
  * message. Otherwise, it returns ACT_RET_PRS_OK and the variable <expr>
@@ -755,10 +741,6 @@ static enum act_parse_ret parse_store(const char **args, int *arg, struct proxy 
 	/* There is no fetch method when variable is unset. Just set the right
 	 * action and return. */
 	if (!set_var) {
-		if (*args[*arg]) {
-			memprintf(err, "fetch method not supported");
-			return ACT_RET_PRS_ERR;
-		}
 		rule->action     = ACT_CUSTOM;
 		rule->action_ptr = action_clear;
 		return ACT_RET_PRS_OK;
@@ -851,11 +833,15 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ /* END */ },
 }};
 
+INITCALL1(STG_REGISTER, sample_register_fetches, &sample_fetch_keywords);
+
 static struct sample_conv_kw_list sample_conv_kws = {ILH, {
 	{ "set-var",   smp_conv_store, ARG1(1,STR), conv_check_var, SMP_T_ANY, SMP_T_ANY },
 	{ "unset-var", smp_conv_clear, ARG1(1,STR), conv_check_var, SMP_T_ANY, SMP_T_ANY },
 	{ /* END */ },
 }};
+
+INITCALL1(STG_REGISTER, sample_register_convs, &sample_conv_kws);
 
 static struct action_kw_list tcp_req_sess_kws = { { }, {
 	{ "set-var",   parse_store, 1 },
@@ -863,11 +849,15 @@ static struct action_kw_list tcp_req_sess_kws = { { }, {
 	{ /* END */ }
 }};
 
+INITCALL1(STG_REGISTER, tcp_req_sess_keywords_register, &tcp_req_sess_kws);
+
 static struct action_kw_list tcp_req_cont_kws = { { }, {
 	{ "set-var",   parse_store, 1 },
 	{ "unset-var", parse_store, 1 },
 	{ /* END */ }
 }};
+
+INITCALL1(STG_REGISTER, tcp_req_cont_keywords_register, &tcp_req_cont_kws);
 
 static struct action_kw_list tcp_res_kws = { { }, {
 	{ "set-var",   parse_store, 1 },
@@ -875,17 +865,23 @@ static struct action_kw_list tcp_res_kws = { { }, {
 	{ /* END */ }
 }};
 
+INITCALL1(STG_REGISTER, tcp_res_cont_keywords_register, &tcp_res_kws);
+
 static struct action_kw_list http_req_kws = { { }, {
 	{ "set-var",   parse_store, 1 },
 	{ "unset-var", parse_store, 1 },
 	{ /* END */ }
 }};
 
+INITCALL1(STG_REGISTER, http_req_keywords_register, &http_req_kws);
+
 static struct action_kw_list http_res_kws = { { }, {
 	{ "set-var",   parse_store, 1 },
 	{ "unset-var", parse_store, 1 },
 	{ /* END */ }
 }};
+
+INITCALL1(STG_REGISTER, http_res_keywords_register, &http_res_kws);
 
 static struct cfg_kw_list cfg_kws = {{ },{
 	{ CFG_GLOBAL, "tune.vars.global-max-size", vars_max_size_global },
@@ -896,19 +892,4 @@ static struct cfg_kw_list cfg_kws = {{ },{
 	{ /* END */ }
 }};
 
-__attribute__((constructor))
-static void __vars_init(void)
-{
-	var_pool = create_pool("vars", sizeof(struct var), MEM_F_SHARED);
-
-	sample_register_fetches(&sample_fetch_keywords);
-	sample_register_convs(&sample_conv_kws);
-	tcp_req_sess_keywords_register(&tcp_req_sess_kws);
-	tcp_req_cont_keywords_register(&tcp_req_cont_kws);
-	tcp_res_cont_keywords_register(&tcp_res_kws);
-	http_req_keywords_register(&http_req_kws);
-	http_res_keywords_register(&http_res_kws);
-	cfg_register_keywords(&cfg_kws);
-
-	HA_RWLOCK_INIT(&var_names_rwlock);
-}
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);

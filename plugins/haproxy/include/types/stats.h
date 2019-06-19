@@ -38,11 +38,27 @@
 
 /* HTTP stats : applet.st0 */
 enum {
-	STAT_HTTP_DONE = 0,  /* finished */
+	STAT_HTTP_INIT = 0,  /* Initial state */
 	STAT_HTTP_HEAD,      /* send headers before dump */
 	STAT_HTTP_DUMP,      /* dumping stats */
 	STAT_HTTP_POST,      /* waiting post data */
 	STAT_HTTP_LAST,      /* sending last chunk of response */
+	STAT_HTTP_DONE,      /* dump is finished */
+	STAT_HTTP_END,       /* finished */
+};
+
+/* status codes available for the stats admin page */
+enum {
+	STAT_STATUS_INIT = 0,
+	STAT_STATUS_DENY,	/* action denied */
+	STAT_STATUS_DONE,	/* the action is successful */
+	STAT_STATUS_ERRP,	/* an error occurred due to invalid values in parameters */
+	STAT_STATUS_EXCD,	/* an error occurred because the buffer couldn't store all data */
+	STAT_STATUS_NONE,	/* nothing happened (no action chosen or servers state didn't change) */
+	STAT_STATUS_PART,	/* the action is partially successful */
+	STAT_STATUS_UNKN,	/* an unknown error occurred, shouldn't happen */
+	STAT_STATUS_IVAL,       /* invalid requests (chunked or invalid post) */
+	STAT_STATUS_SIZE
 };
 
 /* HTML form to limit output scope */
@@ -290,7 +306,15 @@ enum info_field {
 	INF_DESCRIPTION,
 	INF_STOPPING,
 	INF_JOBS,
+	INF_UNSTOPPABLE_JOBS,
 	INF_LISTENERS,
+	INF_ACTIVE_PEERS,
+	INF_CONNECTED_PEERS,
+	INF_DROPPED_LOGS,
+	INF_BUSY_POLLING,
+	INF_FAILED_RESOLUTIONS,
+	INF_TOTAL_BYTES_OUT,
+	INF_BYTES_OUT_RATE,
 
 	/* must always be the last one */
 	INF_TOTAL_FIELDS
@@ -386,6 +410,11 @@ enum stat_field {
 	ST_F_INTERCEPTED,
 	ST_F_DCON,
 	ST_F_DSES,
+	ST_F_WREW,
+	ST_F_CONNECT,
+	ST_F_REUSE,
+	ST_F_CACHE_LOOKUPS,
+	ST_F_CACHE_HITS,
 
 	/* must always be the last one */
 	ST_F_TOTAL_FIELDS

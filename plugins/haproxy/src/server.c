@@ -19,11 +19,13 @@
 #include <common/cfgparse.h>
 #include <common/config.h>
 #include <common/errors.h>
+#include <common/initcall.h>
 #include <common/namespace.h>
 #include <common/time.h>
 
 #include <types/applet.h>
 #include <types/cli.h>
+#include <types/dict.h>
 #include <types/global.h>
 #include <types/cli.h>
 #include <types/dns.h>
@@ -32,6 +34,7 @@
 #include <proto/applet.h>
 #include <proto/cli.h>
 #include <proto/checks.h>
+#include <proto/connection.h>
 #include <proto/port_range.h>
 #include <proto/protocol.h>
 #include <proto/queue.h>
@@ -44,10 +47,7 @@
 #include <proto/dns.h>
 #include <netinet/tcp.h>
 
-struct list updated_servers = LIST_HEAD_INIT(updated_servers);
-__decl_hathreads(HA_SPINLOCK_T updated_servers_lock);
-
-static void srv_register_update(struct server *srv);
+static void srv_update_status(struct server *s);
 static void srv_update_state(struct server *srv, int version, char **params);
 static int srv_apply_lastaddr(struct server *srv, int *err_code);
 static int srv_set_fqdn(struct server *srv, const char *fqdn, int dns_locked);
@@ -55,6 +55,18 @@ static int srv_set_fqdn(struct server *srv, const char *fqdn, int dns_locked);
 /* List head of all known server keywords */
 static struct srv_kw_list srv_keywords = {
 	.list = LIST_HEAD_INIT(srv_keywords.list)
+};
+
+__decl_hathreads(HA_SPINLOCK_T idle_conn_srv_lock);
+struct eb_root idle_conn_srv = EB_ROOT;
+struct task *idle_conn_task = NULL;
+struct task *idle_conn_cleanup[MAX_THREADS] = { NULL };
+struct list toremove_connections[MAX_THREADS];
+
+/* The server names dictionary */
+struct dict server_name_dict = {
+	.name = "server names",
+	.values = EB_ROOT_UNIQUE,
 };
 
 int srv_downtime(const struct server *s)
@@ -111,6 +123,9 @@ static inline void srv_check_for_dup_dyncookie(struct server *s)
 
 }
 
+/*
+ * Must be called with the server lock held.
+ */
 void srv_set_dyncookie(struct server *s)
 {
 	struct proxy *p = s->proxy;
@@ -142,7 +157,7 @@ void srv_set_dyncookie(struct server *s)
 	 * on the safe side.
 	 */
 	buffer_len = key_len + addr_len + 4;
-	tmpbuf = trash.str;
+	tmpbuf = trash.area;
 	memcpy(tmpbuf, p->dyncookie_key, key_len);
 	memcpy(&(tmpbuf[key_len]),
 	    s->addr.ss_family == AF_INET ?
@@ -314,6 +329,14 @@ static int srv_parse_check_send_proxy(char **args, int *cur_arg,
 	return 0;
 }
 
+/* Parse the "check-via-socks4" server keyword */
+static int srv_parse_check_via_socks4(char **args, int *cur_arg,
+                                      struct proxy *curproxy, struct server *newsrv, char **err)
+{
+	newsrv->check.via_socks4 = 1;
+	return 0;
+}
+
 /* Parse the "cookie" server keyword */
 static int srv_parse_cookie(char **args, int *cur_arg,
                             struct proxy *curproxy, struct server *newsrv, char **err)
@@ -355,6 +378,71 @@ static int srv_parse_enabled(char **args, int *cur_arg,
 	return 0;
 }
 
+static int srv_parse_max_reuse(char **args, int *cur_arg, struct proxy *curproxy, struct server *newsrv, char **err)
+{
+	char *arg;
+
+	arg = args[*cur_arg + 1];
+	if (!*arg) {
+		memprintf(err, "'%s' expects <value> as argument.\n", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	newsrv->max_reuse = atoi(arg);
+
+	return 0;
+}
+
+static int srv_parse_pool_purge_delay(char **args, int *cur_arg, struct proxy *curproxy, struct server *newsrv, char **err)
+{
+	const char *res;
+	char *arg;
+	unsigned int time;
+
+	arg = args[*cur_arg + 1];
+	if (!*arg) {
+		memprintf(err, "'%s' expects <value> as argument.\n", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	res = parse_time_err(arg, &time, TIME_UNIT_MS);
+	if (res == PARSE_TIME_OVER) {
+		memprintf(err, "timer overflow in argument '%s' to '%s' (maximum value is 2147483647 ms or ~24.8 days)",
+			  args[*cur_arg+1], args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	else if (res == PARSE_TIME_UNDER) {
+		memprintf(err, "timer underflow in argument '%s' to '%s' (minimum non-null value is 1 ms)",
+			  args[*cur_arg+1], args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	else if (res) {
+		memprintf(err, "unexpected character '%c' in argument to <%s>.\n",
+		    *res, args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	newsrv->pool_purge_delay = time;
+
+	return 0;
+}
+
+static int srv_parse_pool_max_conn(char **args, int *cur_arg, struct proxy *curproxy, struct server *newsrv, char **err)
+{
+	char *arg;
+
+	arg = args[*cur_arg + 1];
+	if (!*arg) {
+		memprintf(err, "'%s' expects <value> as argument.\n", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	newsrv->max_idle_conns = atoi(arg);
+	if ((int)newsrv->max_idle_conns < -1) {
+		memprintf(err, "'%s' must be >= -1", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	return 0;
+}
+
 /* parse the "id" server keyword */
 static int srv_parse_id(char **args, int *cur_arg, struct proxy *curproxy, struct server *newsrv, char **err)
 {
@@ -391,7 +479,7 @@ static int srv_parse_id(char **args, int *cur_arg, struct proxy *curproxy, struc
 static int srv_parse_namespace(char **args, int *cur_arg,
                                struct proxy *curproxy, struct server *newsrv, char **err)
 {
-#ifdef CONFIG_HAP_NS
+#ifdef USE_NS
 	char *arg;
 
 	arg = args[*cur_arg + 1];
@@ -468,7 +556,7 @@ static int srv_parse_no_check_send_proxy(char **args, int *cur_arg,
 }
 
 /* Disable server PROXY protocol flags. */
-static int inline srv_disable_pp_flags(struct server *srv, unsigned int flags)
+static inline int srv_disable_pp_flags(struct server *srv, unsigned int flags)
 {
 	srv->pp_opts &= ~flags;
 	return 0;
@@ -497,10 +585,65 @@ static int srv_parse_non_stick(char **args, int *cur_arg,
 }
 
 /* Enable server PROXY protocol flags. */
-static int inline srv_enable_pp_flags(struct server *srv, unsigned int flags)
+static inline int srv_enable_pp_flags(struct server *srv, unsigned int flags)
 {
 	srv->pp_opts |= flags;
 	return 0;
+}
+/* parse the "proto" server keyword */
+static int srv_parse_proto(char **args, int *cur_arg,
+			   struct proxy *px, struct server *newsrv, char **err)
+{
+	struct ist proto;
+
+	if (!*args[*cur_arg + 1]) {
+		memprintf(err, "'%s' : missing value", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	proto = ist2(args[*cur_arg + 1], strlen(args[*cur_arg + 1]));
+	newsrv->mux_proto = get_mux_proto(proto);
+	if (!newsrv->mux_proto) {
+		memprintf(err, "'%s' :  unknown MUX protocol '%s'", args[*cur_arg], args[*cur_arg+1]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	return 0;
+}
+
+/* parse the "proxy-v2-options" */
+static int srv_parse_proxy_v2_options(char **args, int *cur_arg,
+				      struct proxy *px, struct server *newsrv, char **err)
+{
+	char *p, *n;
+	for (p = args[*cur_arg+1]; p; p = n) {
+		n = strchr(p, ',');
+		if (n)
+			*n++ = '\0';
+		if (!strcmp(p, "ssl")) {
+			newsrv->pp_opts |= SRV_PP_V2_SSL;
+		} else if (!strcmp(p, "cert-cn")) {
+			newsrv->pp_opts |= SRV_PP_V2_SSL;
+			newsrv->pp_opts |= SRV_PP_V2_SSL_CN;
+		} else if (!strcmp(p, "cert-key")) {
+			newsrv->pp_opts |= SRV_PP_V2_SSL;
+			newsrv->pp_opts |= SRV_PP_V2_SSL_KEY_ALG;
+		} else if (!strcmp(p, "cert-sig")) {
+			newsrv->pp_opts |= SRV_PP_V2_SSL;
+			newsrv->pp_opts |= SRV_PP_V2_SSL_SIG_ALG;
+		} else if (!strcmp(p, "ssl-cipher")) {
+			newsrv->pp_opts |= SRV_PP_V2_SSL;
+			newsrv->pp_opts |= SRV_PP_V2_SSL_CIPHER;
+		} else if (!strcmp(p, "authority")) {
+			newsrv->pp_opts |= SRV_PP_V2_AUTHORITY;
+		} else if (!strcmp(p, "crc32c")) {
+			newsrv->pp_opts |= SRV_PP_V2_CRC32C;
+		} else
+			goto fail;
+	}
+	return 0;
+ fail:
+	if (err)
+		memprintf(err, "'%s' : proxy v2 option not implemented", p);
+	return ERR_ALERT | ERR_FATAL;
 }
 
 /* Parse the "observe" server keyword */
@@ -770,10 +913,68 @@ static int srv_parse_track(char **args, int *cur_arg,
 	return 0;
 }
 
+/* Parse the "socks4" server keyword */
+static int srv_parse_socks4(char **args, int *cur_arg,
+                            struct proxy *curproxy, struct server *newsrv, char **err)
+{
+	char *errmsg;
+	int port_low, port_high;
+	struct sockaddr_storage *sk;
+	struct protocol *proto;
+
+	errmsg = NULL;
+
+	if (!*args[*cur_arg + 1]) {
+		memprintf(err, "'%s' expects <addr>:<port> as argument.\n", args[*cur_arg]);
+		goto err;
+	}
+
+	/* 'sk' is statically allocated (no need to be freed). */
+	sk = str2sa_range(args[*cur_arg + 1], NULL, &port_low, &port_high, &errmsg, NULL, NULL, 1);
+	if (!sk) {
+		memprintf(err, "'%s %s' : %s\n", args[*cur_arg], args[*cur_arg + 1], errmsg);
+		goto err;
+	}
+
+	proto = protocol_by_family(sk->ss_family);
+	if (!proto || !proto->connect) {
+		ha_alert("'%s %s' : connect() not supported for this address family.\n", args[*cur_arg], args[*cur_arg + 1]);
+		goto err;
+	}
+
+	newsrv->flags |= SRV_F_SOCKS4_PROXY;
+	newsrv->socks4_addr = *sk;
+
+	if (port_low != port_high) {
+		ha_alert("'%s' does not support port offsets (found '%s').\n", args[*cur_arg], args[*cur_arg + 1]);
+		goto err;
+	}
+
+	if (!port_low) {
+		ha_alert("'%s': invalid port range %d-%d.\n", args[*cur_arg], port_low, port_high);
+		goto err;
+	}
+
+	return 0;
+
+ err:
+	free(errmsg);
+	return ERR_ALERT | ERR_FATAL;
+}
+
+
+/* parse the "tfo" server keyword */
+static int srv_parse_tfo(char **args, int *cur_arg, struct proxy *px, struct server *newsrv, char **err)
+{
+	newsrv->flags |= SRV_F_FASTOPEN;
+	return 0;
+}
 
 /* Shutdown all connections of a server. The caller must pass a termination
  * code in <why>, which must be one of SF_ERR_* indicating the reason for the
  * shutdown.
+ *
+ * Must be called with the server lock held.
  */
 void srv_shutdown_streams(struct server *srv, int why)
 {
@@ -787,6 +988,8 @@ void srv_shutdown_streams(struct server *srv, int why)
 /* Shutdown all connections of all backup servers of a proxy. The caller must
  * pass a termination code in <why>, which must be one of SF_ERR_* indicating
  * the reason for the shutdown.
+ *
+ * Must be called with the server lock held.
  */
 void srv_shutdown_backup_streams(struct proxy *px, int why)
 {
@@ -806,8 +1009,11 @@ void srv_shutdown_backup_streams(struct proxy *px, int why)
  * using the check results stored into the struct server if present.
  * If <xferred> is non-negative, some information about requeued sessions are
  * provided.
+ *
+ * Must be called with the server lock held.
  */
-void srv_append_status(struct chunk *msg, struct server *s, struct check *check, int xferred, int forced)
+void srv_append_status(struct buffer *msg, struct server *s,
+		       struct check *check, int xferred, int forced)
 {
 	short status = s->op_st_chg.status;
 	short code = s->op_st_chg.code;
@@ -828,7 +1034,7 @@ void srv_append_status(struct chunk *msg, struct server *s, struct check *check,
 			chunk_appendf(msg, ", code: %d", code);
 
 		if (desc && *desc) {
-			struct chunk src;
+			struct buffer src;
 
 			chunk_appendf(msg, ", info: \"");
 
@@ -870,6 +1076,8 @@ void srv_append_status(struct chunk *msg, struct server *s, struct check *check,
  * a sync point. Maintenance servers are ignored. It stores the <reason> if
  * non-null as the reason for going down or the available data from the check
  * struct to recompute this reason later.
+ *
+ * Must be called with the server lock held.
  */
 void srv_set_stopped(struct server *s, const char *reason, struct check *check)
 {
@@ -891,7 +1099,9 @@ void srv_set_stopped(struct server *s, const char *reason, struct check *check)
 		s->op_st_chg.duration = check->duration;
 	}
 
-	srv_register_update(s);
+	/* propagate changes */
+	srv_update_status(s);
+
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 		srv_set_stopped(srv, NULL, NULL);
@@ -905,6 +1115,8 @@ void srv_set_stopped(struct server *s, const char *reason, struct check *check)
  * proxy at a sync point. Maintenance servers are ignored. It stores the
  * <reason> if non-null as the reason for going down or the available data
  * from the check struct to recompute this reason later.
+ *
+ * Must be called with the server lock held.
  */
 void srv_set_running(struct server *s, const char *reason, struct check *check)
 {
@@ -932,7 +1144,9 @@ void srv_set_running(struct server *s, const char *reason, struct check *check)
 	if (s->slowstart <= 0)
 		s->next_state = SRV_ST_RUNNING;
 
-	srv_register_update(s);
+	/* propagate changes */
+	srv_update_status(s);
+
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 		srv_set_running(srv, NULL, NULL);
@@ -948,6 +1162,8 @@ void srv_set_running(struct server *s, const char *reason, struct check *check)
  * from the check struct to recompute this reason later.
  * up. Note that it makes use of the trash to build the log strings, so <reason>
  * must not be placed there.
+ *
+ * Must be called with the server lock held.
  */
 void srv_set_stopping(struct server *s, const char *reason, struct check *check)
 {
@@ -972,7 +1188,9 @@ void srv_set_stopping(struct server *s, const char *reason, struct check *check)
 		s->op_st_chg.duration = check->duration;
 	}
 
-	srv_register_update(s);
+	/* propagate changes */
+	srv_update_status(s);
+
 	for (srv = s->trackers; srv; srv = srv->tracknext) {
 		HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 		srv_set_stopping(srv, NULL, NULL);
@@ -987,6 +1205,8 @@ void srv_set_stopping(struct server *s, const char *reason, struct check *check)
  * checks). When either the flag is already set or no flag is passed, nothing
  * is done. If <cause> is non-null, it will be displayed at the end of the log
  * lines to justify the state change.
+ *
+ * Must be called with the server lock held.
  */
 void srv_set_admin_flag(struct server *s, enum srv_admin mode, const char *cause)
 {
@@ -1003,7 +1223,8 @@ void srv_set_admin_flag(struct server *s, enum srv_admin mode, const char *cause
 	if (cause)
 		strlcpy2(s->adm_st_chg_cause, cause, sizeof(s->adm_st_chg_cause));
 
-	srv_register_update(s);
+	/* propagate changes */
+	srv_update_status(s);
 
 	/* stop going down if the equivalent flag was already present (forced or inherited) */
 	if (((mode & SRV_ADMF_MAINT) && (s->next_admin & ~mode & SRV_ADMF_MAINT)) ||
@@ -1028,6 +1249,8 @@ void srv_set_admin_flag(struct server *s, enum srv_admin mode, const char *cause
  * than one flag at once. The equivalent "inherited" flag is propagated to all
  * tracking servers. Leaving maintenance mode re-enables health checks. When
  * either the flag is already cleared or no flag is passed, nothing is done.
+ *
+ * Must be called with the server lock held.
  */
 void srv_clr_admin_flag(struct server *s, enum srv_admin mode)
 {
@@ -1042,7 +1265,8 @@ void srv_clr_admin_flag(struct server *s, enum srv_admin mode)
 
 	s->next_admin &= ~mode;
 
-	srv_register_update(s);
+	/* propagate changes */
+	srv_update_status(s);
 
 	/* stop going down if the equivalent flag is still present (forced or inherited) */
 	if (((mode & SRV_ADMF_MAINT) && (s->next_admin & SRV_ADMF_MAINT)) ||
@@ -1115,6 +1339,7 @@ static struct srv_kw_list srv_kws = { "ALL", { }, {
 	{ "disabled",            srv_parse_disabled,            0,  1 }, /* Start the server in 'disabled' state */
 	{ "enabled",             srv_parse_enabled,             0,  1 }, /* Start the server in 'enabled' state */
 	{ "id",                  srv_parse_id,                  1,  0 }, /* set id# of server */
+	{ "max-reuse",           srv_parse_max_reuse,           1,  1 }, /* Set the max number of requests on a connection, -1 means unlimited */
 	{ "namespace",           srv_parse_namespace,           1,  1 }, /* Namespace the server socket belongs to (if supported) */
 	{ "no-agent-check",      srv_parse_no_agent_check,      0,  1 }, /* Do not enable any auxiliary agent check */
 	{ "no-backup",           srv_parse_no_backup,           0,  1 }, /* Flag as non-backup server */
@@ -1124,26 +1349,32 @@ static struct srv_kw_list srv_kws = { "ALL", { }, {
 	{ "no-send-proxy-v2",    srv_parse_no_send_proxy_v2,    0,  1 }, /* Disable use of PROXY V2 protocol */
 	{ "non-stick",           srv_parse_non_stick,           0,  1 }, /* Disable stick-table persistence */
 	{ "observe",             srv_parse_observe,             1,  1 }, /* Enables health adjusting based on observing communication with the server */
+	{ "pool-max-conn",       srv_parse_pool_max_conn,       1,  1 }, /* Set the max number of orphan idle connections, 0 means unlimited */
+	{ "pool-purge-delay",    srv_parse_pool_purge_delay,    1,  1 }, /* Set the time before we destroy orphan idle connections, defaults to 1s */
+	{ "proto",               srv_parse_proto,               1,  1 }, /* Set the proto to use for all outgoing connections */
+	{ "proxy-v2-options",    srv_parse_proxy_v2_options,    1,  1 }, /* options for send-proxy-v2 */
 	{ "redir",               srv_parse_redir,               1,  1 }, /* Enable redirection mode */
 	{ "send-proxy",          srv_parse_send_proxy,          0,  1 }, /* Enforce use of PROXY V1 protocol */
 	{ "send-proxy-v2",       srv_parse_send_proxy_v2,       0,  1 }, /* Enforce use of PROXY V2 protocol */
 	{ "source",              srv_parse_source,             -1,  1 }, /* Set the source address to be used to connect to the server */
 	{ "stick",               srv_parse_stick,               0,  1 }, /* Enable stick-table persistence */
+	{ "tfo",                 srv_parse_tfo,                 0,  0 }, /* enable TCP Fast Open of server */
 	{ "track",               srv_parse_track,               1,  1 }, /* Set the current state of the server, tracking another one */
+	{ "socks4",              srv_parse_socks4,              1,  1 }, /* Set the socks4 proxy of the server*/
+	{ "check-via-socks4",    srv_parse_check_via_socks4,    0,  1 }, /* enable socks4 proxy for health checks */
 	{ NULL, NULL, 0 },
 }};
 
-__attribute__((constructor))
-static void __listener_init(void)
-{
-	srv_register_keywords(&srv_kws);
-}
+INITCALL1(STG_REGISTER, srv_register_keywords, &srv_kws);
 
 /* Recomputes the server's eweight based on its state, uweight, the current time,
  * and the proxy's algorihtm. To be used after updating sv->uweight. The warmup
- * state is automatically disabled if the time is elapsed.
+ * state is automatically disabled if the time is elapsed. If <must_update> is
+ * not zero, the update will be propagated immediately.
+ *
+ * Must be called with the server lock held.
  */
-void server_recalc_eweight(struct server *sv)
+void server_recalc_eweight(struct server *sv, int must_update)
 {
 	struct proxy *px = sv->proxy;
 	unsigned w;
@@ -1164,12 +1395,16 @@ void server_recalc_eweight(struct server *sv)
 
 	sv->next_eweight = (sv->uweight * w + px->lbprm.wmult - 1) / px->lbprm.wmult;
 
-	srv_register_update(sv);
+	/* propagate changes only if needed (i.e. not recursively) */
+	if (must_update)
+		srv_update_status(sv);
 }
 
 /*
  * Parses weight_str and configures sv accordingly.
  * Returns NULL on success, error message string otherwise.
+ *
+ * Must be called with the server lock held.
  */
 const char *server_parse_weight_change_request(struct server *sv,
 					       const char *weight_str)
@@ -1208,7 +1443,7 @@ const char *server_parse_weight_change_request(struct server *sv,
 		return "Backend is using a static LB algorithm and only accepts weights '0%' and '100%'.\n";
 
 	sv->uweight = w;
-	server_recalc_eweight(sv);
+	server_recalc_eweight(sv, 1);
 
 	return NULL;
 }
@@ -1219,6 +1454,8 @@ const char *server_parse_weight_change_request(struct server *sv,
  * Returns:
  *  - error string on error
  *  - NULL on success
+ *
+ * Must be called with the server lock held.
  */
 const char *server_parse_addr_change_request(struct server *sv,
                                              const char *addr_str, const char *updater)
@@ -1237,6 +1474,9 @@ const char *server_parse_addr_change_request(struct server *sv,
 	return "Could not understand IP address format.\n";
 }
 
+/*
+ * Must be called with the server lock held.
+ */
 const char *server_parse_maxconn_change_request(struct server *sv,
                                                 const char *maxconn_str)
 {
@@ -1380,12 +1620,33 @@ static void srv_ssl_settings_cpy(struct server *srv, struct server *src)
 		srv->ssl_ctx.verify_host = strdup(src->ssl_ctx.verify_host);
 	if (src->ssl_ctx.ciphers != NULL)
 		srv->ssl_ctx.ciphers = strdup(src->ssl_ctx.ciphers);
-#if (OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined OPENSSL_IS_BORINGSSL && !defined LIBRESSL_VERSION_NUMBER)
+#if (HA_OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined OPENSSL_IS_BORINGSSL)
 	if (src->ssl_ctx.ciphersuites != NULL)
 		srv->ssl_ctx.ciphersuites = strdup(src->ssl_ctx.ciphersuites);
 #endif
 	if (src->sni_expr != NULL)
 		srv->sni_expr = strdup(src->sni_expr);
+
+#ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
+	if (src->ssl_ctx.alpn_str) {
+		srv->ssl_ctx.alpn_str = malloc(src->ssl_ctx.alpn_len);
+		if (srv->ssl_ctx.alpn_str) {
+			memcpy(srv->ssl_ctx.alpn_str, src->ssl_ctx.alpn_str,
+			    src->ssl_ctx.alpn_len);
+			srv->ssl_ctx.alpn_len = src->ssl_ctx.alpn_len;
+		}
+	}
+#endif
+#ifdef OPENSSL_NPN_NEGOTIATED
+	if (src->ssl_ctx.npn_str) {
+		srv->ssl_ctx.npn_str = malloc(src->ssl_ctx.npn_len);
+		if (srv->ssl_ctx.npn_str) {
+			memcpy(srv->ssl_ctx.npn_str, src->ssl_ctx.npn_str,
+			    src->ssl_ctx.npn_len);
+			srv->ssl_ctx.npn_len = src->ssl_ctx.npn_len;
+		}
+	}
+#endif
 }
 #endif
 
@@ -1403,7 +1664,7 @@ static int srv_prepare_for_resolution(struct server *srv, const char *hostname)
 		return 0;
 
 	hostname_len    = strlen(hostname);
-	hostname_dn     = trash.str;
+	hostname_dn     = trash.area;
 	hostname_dn_len = dns_str_to_dn_label(hostname, hostname_len + 1,
 					      hostname_dn, trash.size);
 	if (hostname_dn_len == -1)
@@ -1461,6 +1722,8 @@ static void srv_settings_cpy(struct server *srv, struct server *src, int srv_tmp
 	srv->check.use_ssl            = src->check.use_ssl;
 	srv->check.port               = src->check.port;
 	srv->check.sni                = src->check.sni;
+	srv->check.alpn_str           = src->check.alpn_str;
+	srv->check.alpn_len           = src->check.alpn_len;
 	/* Note: 'flags' field has potentially been already initialized. */
 	srv->flags                   |= src->flags;
 	srv->do_check                 = src->do_check;
@@ -1527,11 +1790,19 @@ static void srv_settings_cpy(struct server *srv, struct server *src, int srv_tmp
 #ifdef TCP_USER_TIMEOUT
 	srv->tcp_ut = src->tcp_ut;
 #endif
+	srv->mux_proto = src->mux_proto;
+	srv->pool_purge_delay = src->pool_purge_delay;
+	srv->max_idle_conns = src->max_idle_conns;
+	srv->max_reuse = src->max_reuse;
+
 	if (srv_tmpl)
 		srv->srvrq = src->srvrq;
+
+	srv->check.via_socks4         = src->check.via_socks4;
+	srv->socks4_addr              = src->socks4_addr;
 }
 
-static struct server *new_server(struct proxy *proxy)
+struct server *new_server(struct proxy *proxy)
 {
 	struct server *srv;
 
@@ -1542,19 +1813,24 @@ static struct server *new_server(struct proxy *proxy)
 	srv->obj_type = OBJ_TYPE_SERVER;
 	srv->proxy = proxy;
 	LIST_INIT(&srv->actconns);
-	LIST_INIT(&srv->pendconns);
+	srv->pendconns = EB_ROOT;
 
 	srv->next_state = SRV_ST_RUNNING; /* early server setup */
 	srv->last_change = now.tv_sec;
 
 	srv->check.status = HCHK_STATUS_INI;
 	srv->check.server = srv;
+	srv->check.proxy = proxy;
 	srv->check.tcpcheck_rules = &proxy->tcpcheck_rules;
 
 	srv->agent.status = HCHK_STATUS_INI;
 	srv->agent.server = srv;
+	srv->agent.proxy = proxy;
 	srv->xprt  = srv->check.xprt = srv->agent.xprt = xprt_get(XPRT_RAW);
 
+	/* please don't put default server settings here, they are set in
+	 * init_default_instance().
+	 */
 	return srv;
 }
 
@@ -1754,6 +2030,8 @@ static int server_finalize_init(const char *file, int linenum, char **args, int 
 	srv_lb_commit_status(srv);
 
 	return 0;
+err:
+	return ERR_ALERT | ERR_FATAL;
 }
 
 /*
@@ -1769,9 +2047,9 @@ static int srv_tmpl_parse_range(struct server *srv, const char *arg, int *nb_low
 
 	*nb_high = 0;
 	chunk_printf(&trash, "%s", arg);
-	*nb_low = atoi(trash.str);
+	*nb_low = atoi(trash.area);
 
-	if ((nb_high_arg = strchr(trash.str, '-'))) {
+	if ((nb_high_arg = strchr(trash.area, '-'))) {
 		*nb_high_arg++ = '\0';
 		*nb_high = atoi(nb_high_arg);
 	}
@@ -1790,7 +2068,7 @@ static inline void srv_set_id_from_prefix(struct server *srv, const char *prefix
 {
 	chunk_printf(&trash, "%s%d", prefix, nb);
 	free(srv->id);
-	srv->id = strdup(trash.str);
+	srv->id = strdup(trash.area);
 }
 
 /*
@@ -1798,7 +2076,7 @@ static inline void srv_set_id_from_prefix(struct server *srv, const char *prefix
  * Note that a server template is a special server with
  * a few different parameters than a server which has
  * been parsed mostly the same way as a server.
- * Returns the number of servers succesfully allocated,
+ * Returns the number of servers successfully allocated,
  * 'srv' template included.
  */
 static int server_template_init(struct server *srv, struct proxy *px)
@@ -1855,7 +2133,7 @@ static int server_template_init(struct server *srv, struct proxy *px)
 	return i - srv->tmpl_info.nb_low;
 }
 
-int parse_server(const char *file, int linenum, char **args, struct proxy *curproxy, struct proxy *defproxy)
+int parse_server(const char *file, int linenum, char **args, struct proxy *curproxy, struct proxy *defproxy, int parse_addr)
 {
 	struct server *newsrv = NULL;
 	const char *err = NULL;
@@ -1865,11 +2143,12 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 	char *fqdn = NULL;
 
 	if (!strcmp(args[0], "server")         ||
+	    !strcmp(args[0], "peer")           ||
 	    !strcmp(args[0], "default-server") ||
 	    !strcmp(args[0], "server-template")) {
 		int cur_arg;
 		int defsrv = (*args[0] == 'd');
-		int srv = !defsrv && !strcmp(args[0], "server");
+		int srv = !defsrv && (*args[0] == 'p' || !strcmp(args[0], "server"));
 		int srv_tmpl = !defsrv && !srv;
 		int tmpl_range_low = 0, tmpl_range_high = 0;
 
@@ -1882,7 +2161,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			err_code |= ERR_WARN;
 
 		/* There is no mandatory first arguments for default server. */
-		if (srv) {
+		if (srv && parse_addr) {
 			if (!*args[2]) {
 				/* 'server' line number of argument check. */
 				ha_alert("parsing [%s:%d] : '%s' expects <name> and <addr>[:<port>] as arguments.\n",
@@ -1962,6 +2241,9 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			 *  - IP:+N => port=+N, relative
 			 *  - IP:-N => port=-N, relative
 			 */
+			if (!parse_addr)
+				goto skip_addr;
+
 			sk = str2sa_range(args[cur_arg], &port, &port1, &port2, &errmsg, NULL, &fqdn, 0);
 			if (!sk) {
 				ha_alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], errmsg);
@@ -2018,10 +2300,11 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 				goto out;
 			}
 
+			cur_arg++;
+ skip_addr:
 			/* Copy default server settings to new server settings. */
 			srv_settings_cpy(newsrv, &curproxy->defsrv, 0);
 			HA_SPIN_INIT(&newsrv->lock);
-			cur_arg++;
 		} else {
 			newsrv = &curproxy->defsrv;
 			cur_arg = 1;
@@ -2032,7 +2315,20 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 		while (*args[cur_arg]) {
 			if (!strcmp(args[cur_arg], "agent-inter")) {
 				const char *err = parse_time_err(args[cur_arg + 1], &val, TIME_UNIT_MS);
-				if (err) {
+
+				if (err == PARSE_TIME_OVER) {
+					ha_alert("parsing [%s:%d]: timer overflow in argument <%s> to <%s> of server %s, maximum value is 2147483647 ms (~24.8 days).\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err == PARSE_TIME_UNDER) {
+					ha_alert("parsing [%s:%d]: timer underflow in argument <%s> to <%s> of server %s, minimum non-null value is 1 ms.\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err) {
 					ha_alert("parsing [%s:%d] : unexpected character '%c' in 'agent-inter' argument of server %s.\n",
 					      file, linenum, *err, newsrv->id);
 					err_code |= ERR_ALERT | ERR_FATAL;
@@ -2180,7 +2476,7 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 				p = args[cur_arg + 1];
 				e = p;
 				while (*p != '\0') {
-					/* If no room avalaible, return error. */
+					/* If no room available, return error. */
 					if (opt->pref_net_nb >= SRV_MAX_PREF_NET) {
 						ha_alert("parsing [%s:%d]: '%s' exceed %d networks.\n",
 						      file, linenum, args[cur_arg], SRV_MAX_PREF_NET);
@@ -2257,7 +2553,20 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			}
 			else if (!strcmp(args[cur_arg], "inter")) {
 				const char *err = parse_time_err(args[cur_arg + 1], &val, TIME_UNIT_MS);
-				if (err) {
+
+				if (err == PARSE_TIME_OVER) {
+					ha_alert("parsing [%s:%d]: timer overflow in argument <%s> to <%s> of server %s, maximum value is 2147483647 ms (~24.8 days).\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err == PARSE_TIME_UNDER) {
+					ha_alert("parsing [%s:%d]: timer underflow in argument <%s> to <%s> of server %s, minimum non-null value is 1 ms.\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err) {
 					ha_alert("parsing [%s:%d] : unexpected character '%c' in 'inter' argument of server %s.\n",
 					      file, linenum, *err, newsrv->id);
 					err_code |= ERR_ALERT | ERR_FATAL;
@@ -2274,7 +2583,20 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			}
 			else if (!strcmp(args[cur_arg], "fastinter")) {
 				const char *err = parse_time_err(args[cur_arg + 1], &val, TIME_UNIT_MS);
-				if (err) {
+
+				if (err == PARSE_TIME_OVER) {
+					ha_alert("parsing [%s:%d]: timer overflow in argument <%s> to <%s> of server %s, maximum value is 2147483647 ms (~24.8 days).\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err == PARSE_TIME_UNDER) {
+					ha_alert("parsing [%s:%d]: timer underflow in argument <%s> to <%s> of server %s, minimum non-null value is 1 ms.\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err) {
 					ha_alert("parsing [%s:%d]: unexpected character '%c' in 'fastinter' argument of server %s.\n",
 					      file, linenum, *err, newsrv->id);
 					err_code |= ERR_ALERT | ERR_FATAL;
@@ -2291,7 +2613,20 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			}
 			else if (!strcmp(args[cur_arg], "downinter")) {
 				const char *err = parse_time_err(args[cur_arg + 1], &val, TIME_UNIT_MS);
-				if (err) {
+
+				if (err == PARSE_TIME_OVER) {
+					ha_alert("parsing [%s:%d]: timer overflow in argument <%s> to <%s> of server %s, maximum value is 2147483647 ms (~24.8 days).\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err == PARSE_TIME_UNDER) {
+					ha_alert("parsing [%s:%d]: timer underflow in argument <%s> to <%s> of server %s, minimum non-null value is 1 ms.\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err) {
 					ha_alert("parsing [%s:%d]: unexpected character '%c' in 'downinter' argument of server %s.\n",
 					      file, linenum, *err, newsrv->id);
 					err_code |= ERR_ALERT | ERR_FATAL;
@@ -2338,7 +2673,20 @@ int parse_server(const char *file, int linenum, char **args, struct proxy *curpr
 			else if (!strcmp(args[cur_arg], "slowstart")) {
 				/* slowstart is stored in seconds */
 				const char *err = parse_time_err(args[cur_arg + 1], &val, TIME_UNIT_MS);
-				if (err) {
+
+				if (err == PARSE_TIME_OVER) {
+					ha_alert("parsing [%s:%d]: timer overflow in argument <%s> to <%s> of server %s, maximum value is 2147483647 ms (~24.8 days).\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err == PARSE_TIME_UNDER) {
+					ha_alert("parsing [%s:%d]: timer underflow in argument <%s> to <%s> of server %s, minimum non-null value is 1 ms.\n",
+						 file, linenum, args[cur_arg+1], args[cur_arg], newsrv->id);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				else if (err) {
 					ha_alert("parsing [%s:%d] : unexpected character '%c' in 'slowstart' argument of server %s.\n",
 					      file, linenum, *err, newsrv->id);
 					err_code |= ERR_ALERT | ERR_FATAL;
@@ -2613,23 +2961,14 @@ struct server *server_find_best_match(struct proxy *bk, char *name, int id, int 
 	return NULL;
 }
 
-/* Registers changes to be applied asynchronously */
-static void srv_register_update(struct server *srv)
-{
-	if (LIST_ISEMPTY(&srv->update_status)) {
-		THREAD_WANT_SYNC();
-		HA_SPIN_LOCK(UPDATED_SERVERS_LOCK, &updated_servers_lock);
-		if (LIST_ISEMPTY(&srv->update_status))
-			LIST_ADDQ(&updated_servers, &srv->update_status);
-		HA_SPIN_UNLOCK(UPDATED_SERVERS_LOCK, &updated_servers_lock);
-	}
-}
-
-/* Update a server state using the parameters available in the params list */
+/* Update a server state using the parameters available in the params list.
+ *
+ * Grabs the server lock during operation.
+ */
 static void srv_update_state(struct server *srv, int version, char **params)
 {
 	char *p;
-	struct chunk *msg;
+	struct buffer *msg;
 
 	/* fields since version 1
 	 * and common to all other upcoming versions
@@ -2813,7 +3152,7 @@ static void srv_update_state(struct server *srv, int version, char **params)
 				srvrecord = NULL;
 
 			/* don't apply anything if one error has been detected */
-			if (msg->len)
+			if (msg->data)
 				goto out;
 
 			HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
@@ -2932,7 +3271,7 @@ static void srv_update_state(struct server *srv, int version, char **params)
 			if (srv_iweight == srv->iweight) {
 				srv->uweight = srv_uweight;
 			}
-			server_recalc_eweight(srv);
+			server_recalc_eweight(srv, 1);
 
 			/* load server IP address */
 			if (strcmp(params[0], "-"))
@@ -2949,7 +3288,7 @@ static void srv_update_state(struct server *srv, int version, char **params)
 					 * - reload for any other reason than a FQDN modification,
 					 * the configuration file FQDN matches the fqdn server state file value.
 					 * So we must reset the 'set from stats socket FQDN' flag to be consistent with
-					 * any futher FQDN modification.
+					 * any further FQDN modification.
 					 */
 					srv->next_admin &= ~SRV_ADMF_HMAINT;
 				}
@@ -3007,7 +3346,6 @@ static void srv_update_state(struct server *srv, int version, char **params)
 				srv->flags &= ~SRV_F_MAPPORTS;
 			}
 
-
 			if (port_str)
 				srv->svc_port = port;
 			HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
@@ -3018,10 +3356,10 @@ static void srv_update_state(struct server *srv, int version, char **params)
 	}
 
  out:
-	if (msg->len) {
+	if (msg->data) {
 		chunk_appendf(msg, "\n");
 		ha_warning("server-state application failed for server '%s/%s'%s",
-			   srv->proxy->id, srv->id, msg->str);
+			   srv->proxy->id, srv->id, msg->area);
 	}
 }
 
@@ -3036,6 +3374,8 @@ static void srv_update_state(struct server *srv, int version, char **params)
  *
  * If the running backend uuid or id differs from the state file, then HAProxy reports
  * a warning.
+ *
+ * Grabs the server's lock via srv_update_state().
  */
 void apply_server_state(void)
 {
@@ -3044,7 +3384,7 @@ void apply_server_state(void)
 	int mybuflen;
 	char *params[SRV_STATE_FILE_MAX_FIELDS] = {0};
 	char *srv_params[SRV_STATE_FILE_MAX_FIELDS] = {0};
-	int arg, srv_arg, version, diff;
+	int arg, srv_arg, version;
 	FILE *f;
 	char *filepath;
 	char globalfilepath[MAXPATHLEN + 1];
@@ -3069,14 +3409,13 @@ void apply_server_state(void)
 		}
 		else if (global.server_state_base) {
 			len = strlen(global.server_state_base);
-			globalfilepathlen += len;
-
-			if (globalfilepathlen > MAXPATHLEN) {
+			if (len > MAXPATHLEN) {
 				globalfilepathlen = 0;
 				goto globalfileerror;
 			}
 			memcpy(globalfilepath, global.server_state_base, len);
-			globalfilepath[globalfilepathlen] = 0;
+			globalfilepath[len] = 0;
+			globalfilepathlen = len;
 
 			/* append a slash if needed */
 			if (!globalfilepathlen || globalfilepath[globalfilepathlen - 1] != '/') {
@@ -3290,7 +3629,6 @@ void apply_server_state(void)
 					break;
 			}
 
-			diff = 0;
 			bk = curproxy;
 
 			/* if backend can't be found, let's continue */
@@ -3309,27 +3647,15 @@ void apply_server_state(void)
 					continue;
 			}
 
-			/* look for the server by its id: param[2] */
-			/* else look for the server by its name: param[3] */
-			diff = 0;
-			srv = server_find_best_match(bk, params[3], atoi(params[2]), &diff);
+			/* look for the server by its name: param[3] */
+			srv = server_find_best_match(bk, params[3], 0, NULL);
 
 			if (!srv) {
 				/* if no server found, then warning and continue with next line */
-				ha_warning("can't find server '%s' with id '%s' in backend with id '%s' or name '%s'\n",
-					   params[3], params[2], params[0], params[1]);
-				send_log(bk, LOG_NOTICE, "can't find server '%s' with id '%s' in backend with id '%s' or name '%s'\n",
-					 params[3], params[2], params[0], params[1]);
-				continue;
-			}
-			else if (diff & PR_FBM_MISMATCH_ID) {
-				ha_warning("In backend '%s' (id: '%d'): server ID mismatch: from server state file: '%s', from running config %d\n", bk->id, bk->uuid, params[2], srv->puid);
-				send_log(bk, LOG_NOTICE, "In backend '%s' (id: %d): server ID mismatch: from server state file: '%s', from running config %d\n", bk->id, bk->uuid, params[2], srv->puid);
-				continue;
-			}
-			else if (diff & PR_FBM_MISMATCH_NAME) {
-				ha_warning("In backend '%s' (id: %d): server name mismatch: from server state file: '%s', from running config '%s'\n", bk->id, bk->uuid, params[3], srv->id);
-				send_log(bk, LOG_NOTICE, "In backend '%s' (id: %d): server name mismatch: from server state file: '%s', from running config '%s'\n", bk->id, bk->uuid, params[3], srv->id);
+				ha_warning("can't find server '%s' in backend '%s'\n",
+					   params[3], params[1]);
+				send_log(bk, LOG_NOTICE, "can't find server '%s' in backend '%s'\n",
+					 params[3], params[1]);
 				continue;
 			}
 
@@ -3349,6 +3675,8 @@ fileclose:
  * updater is used if not NULL.
  *
  * A log line and a stderr warning message is generated based on server's backend options.
+ *
+ * Must be called with the server lock held.
  */
 int update_server_addr(struct server *s, void *ip, int ip_sin_family, const char *updater)
 {
@@ -3386,10 +3714,10 @@ int update_server_addr(struct server *s, void *ip, int ip_sin_family, const char
 				s->proxy->id, s->id, oldip, newip, updater);
 
 		/* write the buffer on stderr */
-		ha_warning("%s.\n", trash.str);
+		ha_warning("%s.\n", trash.area);
 
 		/* send a log */
-		send_log(s->proxy, LOG_NOTICE, "%s.\n", trash.str);
+		send_log(s->proxy, LOG_NOTICE, "%s.\n", trash.area);
 	}
 
 	/* save the new IP family */
@@ -3424,6 +3752,8 @@ int update_server_addr(struct server *s, void *ip, int ip_sin_family, const char
  *     - if switch to port map (SRV_F_MAPPORTS), ensure health check have their own ports
  * - applies required changes to both ADDR and PORT if both 'required' and 'allowed'
  *   conditions are met
+ *
+ * Must be called with the server lock held.
  */
 const char *update_server_addr_port(struct server *s, const char *addr, const char *port, char *updater)
 {
@@ -3431,7 +3761,7 @@ const char *update_server_addr_port(struct server *s, const char *addr, const ch
 	int ret, port_change_required;
 	char current_addr[INET6_ADDRSTRLEN];
 	uint16_t current_port, new_port;
-	struct chunk *msg;
+	struct buffer *msg;
 	int changed = 0;
 
 	msg = get_trash_chunk();
@@ -3575,7 +3905,7 @@ out:
 	if (updater)
 		chunk_appendf(msg, " by '%s'", updater);
 	chunk_appendf(msg, "\n");
-	return msg->str;
+	return msg->area;
 }
 
 
@@ -3584,6 +3914,8 @@ out:
  * returns:
  *  0 if server status is updated
  *  1 if server status has not changed
+ *
+ * Must be called with the server lock held.
  */
 int snr_update_srv_status(struct server *s, int has_no_ip)
 {
@@ -3616,8 +3948,8 @@ int snr_update_srv_status(struct server *s, int has_no_ip)
 			chunk_printf(&trash, "Server %s/%s administratively READY thanks to valid DNS answer",
 			             s->proxy->id, s->id);
 
-			ha_warning("%s.\n", trash.str);
-			send_log(s->proxy, LOG_NOTICE, "%s.\n", trash.str);
+			ha_warning("%s.\n", trash.area);
+			send_log(s->proxy, LOG_NOTICE, "%s.\n", trash.area);
 			return 0;
 
 		case RSLV_STATUS_NX:
@@ -3690,7 +4022,7 @@ int snr_resolution_cb(struct dns_requester *requester, struct dns_nameserver *na
 	void *serverip, *firstip;
 	short server_sin_family, firstip_sin_family;
 	int ret;
-	struct chunk *chk = get_trash_chunk();
+	struct buffer *chk = get_trash_chunk();
 	int has_no_ip = 0;
 
 	s = objt_server(requester->owner);
@@ -3759,7 +4091,7 @@ int snr_resolution_cb(struct dns_requester *requester, struct dns_nameserver *na
 	}
 	else
 		chunk_printf(chk, "DNS cache");
-	update_server_addr(s, firstip, firstip_sin_family, (char *)chk->str);
+	update_server_addr(s, firstip, firstip_sin_family, (char *) chk->area);
 
  update_status:
 	snr_update_srv_status(s, has_no_ip);
@@ -3779,6 +4111,8 @@ int snr_resolution_cb(struct dns_requester *requester, struct dns_nameserver *na
  * returns:
  *  0 on error
  *  1 when no error or safe ignore
+ *
+ * Grabs the server's lock.
  */
 int snr_resolution_error_cb(struct dns_requester *requester, int error_code)
 {
@@ -3872,6 +4206,8 @@ int srv_set_addr_via_libc(struct server *srv, int *err_code)
 
 /* Set the server's FDQN (->hostname) from <hostname>.
  * Returns -1 if failed, 0 if not.
+ *
+ * Must be called with the server lock held.
  */
 int srv_set_fqdn(struct server *srv, const char *hostname, int dns_locked)
 {
@@ -3893,7 +4229,7 @@ int srv_set_fqdn(struct server *srv, const char *hostname, int dns_locked)
 
 	chunk_reset(&trash);
 	hostname_len    = strlen(hostname);
-	hostname_dn     = trash.str;
+	hostname_dn     = trash.area;
 	hostname_dn_len = dns_str_to_dn_label(hostname, hostname_len + 1,
 					      hostname_dn, trash.size);
 	if (hostname_dn_len == -1)
@@ -4052,10 +4388,13 @@ int srv_init_addr(void)
 	return return_code;
 }
 
+/*
+ * Must be called with the server lock held.
+ */
 const char *update_server_fqdn(struct server *server, const char *fqdn, const char *updater, int dns_locked)
 {
 
-	struct chunk *msg;
+	struct buffer *msg;
 
 	msg = get_trash_chunk();
 	chunk_reset(msg);
@@ -4088,7 +4427,7 @@ const char *update_server_fqdn(struct server *server, const char *fqdn, const ch
 		chunk_appendf(msg, " by '%s'", updater);
 	chunk_appendf(msg, "\n");
 
-	return msg->str;
+	return msg->area;
 }
 
 
@@ -4136,7 +4475,8 @@ struct server *cli_find_server(struct appctx *appctx, char *arg)
 }
 
 
-static int cli_parse_set_server(char **args, struct appctx *appctx, void *private)
+/* grabs the server lock */
+static int cli_parse_set_server(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct server *sv;
 	const char *warning;
@@ -4319,7 +4659,7 @@ static int cli_parse_set_server(char **args, struct appctx *appctx, void *privat
 	return 1;
 }
 
-static int cli_parse_get_weight(char **args, struct appctx *appctx, void *private)
+static int cli_parse_get_weight(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct stream_interface *si = appctx->owner;
 	struct proxy *px;
@@ -4349,9 +4689,10 @@ static int cli_parse_get_weight(char **args, struct appctx *appctx, void *privat
 	}
 
 	/* return server's effective weight at the moment */
-	snprintf(trash.str, trash.size, "%d (initial %d)\n", sv->uweight, sv->iweight);
-	if (ci_putstr(si_ic(si), trash.str) == -1) {
-		si_applet_cant_put(si);
+	snprintf(trash.area, trash.size, "%d (initial %d)\n", sv->uweight,
+		 sv->iweight);
+	if (ci_putstr(si_ic(si), trash.area) == -1) {
+		si_rx_room_blk(si);
 		return 0;
 	}
 	return 1;
@@ -4361,7 +4702,7 @@ static int cli_parse_get_weight(char **args, struct appctx *appctx, void *privat
  *
  * Grabs the server lock.
  */
-static int cli_parse_set_weight(char **args, struct appctx *appctx, void *private)
+static int cli_parse_set_weight(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct server *sv;
 	const char *warning;
@@ -4391,7 +4732,7 @@ static int cli_parse_set_weight(char **args, struct appctx *appctx, void *privat
  *
  * Grabs the server lock.
  */
-static int cli_parse_set_maxconn_server(char **args, struct appctx *appctx, void *private)
+static int cli_parse_set_maxconn_server(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct server *sv;
 	const char *warning;
@@ -4421,7 +4762,7 @@ static int cli_parse_set_maxconn_server(char **args, struct appctx *appctx, void
  *
  * Grabs the server lock.
  */
-static int cli_parse_disable_agent(char **args, struct appctx *appctx, void *private)
+static int cli_parse_disable_agent(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct server *sv;
 
@@ -4442,7 +4783,7 @@ static int cli_parse_disable_agent(char **args, struct appctx *appctx, void *pri
  *
  * Grabs the server lock.
  */
-static int cli_parse_disable_health(char **args, struct appctx *appctx, void *private)
+static int cli_parse_disable_health(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct server *sv;
 
@@ -4463,7 +4804,7 @@ static int cli_parse_disable_health(char **args, struct appctx *appctx, void *pr
  *
  * Grabs the server lock.
  */
-static int cli_parse_disable_server(char **args, struct appctx *appctx, void *private)
+static int cli_parse_disable_server(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct server *sv;
 
@@ -4484,7 +4825,7 @@ static int cli_parse_disable_server(char **args, struct appctx *appctx, void *pr
  *
  * Grabs the server lock.
  */
-static int cli_parse_enable_agent(char **args, struct appctx *appctx, void *private)
+static int cli_parse_enable_agent(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct server *sv;
 
@@ -4512,7 +4853,7 @@ static int cli_parse_enable_agent(char **args, struct appctx *appctx, void *priv
  *
  * Grabs the server lock.
  */
-static int cli_parse_enable_health(char **args, struct appctx *appctx, void *private)
+static int cli_parse_enable_health(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct server *sv;
 
@@ -4533,7 +4874,7 @@ static int cli_parse_enable_health(char **args, struct appctx *appctx, void *pri
  *
  * Grabs the server lock.
  */
-static int cli_parse_enable_server(char **args, struct appctx *appctx, void *private)
+static int cli_parse_enable_server(char **args, char *payload, struct appctx *appctx, void *private)
 {
 	struct server *sv;
 
@@ -4570,19 +4911,15 @@ static struct cli_kw_list cli_kws = {{ },{
 	{{},}
 }};
 
-__attribute__((constructor))
-static void __server_init(void)
-{
-	HA_SPIN_INIT(&updated_servers_lock);
-	cli_register_kw(&cli_kws);
-}
+INITCALL1(STG_REGISTER, cli_register_kw, &cli_kws);
 
 /*
  * This function applies server's status changes, it is
  * is designed to be called asynchronously.
  *
+ * Must be called with the server lock held.
  */
-void srv_update_status(struct server *s)
+static void srv_update_status(struct server *s)
 {
 	struct check *check = &s->check;
 	int xferred;
@@ -4590,8 +4927,7 @@ void srv_update_status(struct server *s)
 	int prev_srv_count = s->proxy->srv_bck + s->proxy->srv_act;
 	int srv_was_stopping = (s->cur_state == SRV_ST_STOPPING) || (s->cur_admin & SRV_ADMF_DRAIN);
 	int log_level;
-	struct chunk *tmptrash = NULL;
-
+	struct buffer *tmptrash = NULL;
 
 	/* If currently main is not set we try to apply pending state changes */
 	if (!(s->cur_admin & SRV_ADMF_MAINT)) {
@@ -4624,12 +4960,14 @@ void srv_update_status(struct server *s)
 				             s->proxy->id, s->id);
 
 				srv_append_status(tmptrash, s, NULL, xferred, 0);
-				ha_warning("%s.\n", tmptrash->str);
+				ha_warning("%s.\n", tmptrash->area);
 
 				/* we don't send an alert if the server was previously paused */
 				log_level = srv_was_stopping ? LOG_NOTICE : LOG_ALERT;
-				send_log(s->proxy, log_level, "%s.\n", tmptrash->str);
-				send_email_alert(s, log_level, "%s", tmptrash->str);
+				send_log(s->proxy, log_level, "%s.\n",
+					 tmptrash->area);
+				send_email_alert(s, log_level, "%s",
+						 tmptrash->area);
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
@@ -4657,8 +4995,9 @@ void srv_update_status(struct server *s)
 
 				srv_append_status(tmptrash, s, NULL, xferred, 0);
 
-				ha_warning("%s.\n", tmptrash->str);
-				send_log(s->proxy, LOG_NOTICE, "%s.\n", tmptrash->str);
+				ha_warning("%s.\n", tmptrash->area);
+				send_log(s->proxy, LOG_NOTICE, "%s.\n",
+					 tmptrash->area);
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
@@ -4681,7 +5020,7 @@ void srv_update_status(struct server *s)
 			if (s->next_state == SRV_ST_STARTING)
 				task_schedule(s->warmup, tick_add(now_ms, MS_TO_TICKS(MAX(1000, s->slowstart / 20))));
 
-			server_recalc_eweight(s);
+			server_recalc_eweight(s, 0);
 			/* now propagate the status change to any LB algorithms */
 			if (px->lbprm.update_server_eweight)
 				px->lbprm.update_server_eweight(s);
@@ -4715,9 +5054,11 @@ void srv_update_status(struct server *s)
 				             s->proxy->id, s->id);
 
 				srv_append_status(tmptrash, s, NULL, xferred, 0);
-				ha_warning("%s.\n", tmptrash->str);
-				send_log(s->proxy, LOG_NOTICE, "%s.\n", tmptrash->str);
-				send_email_alert(s, LOG_NOTICE, "%s", tmptrash->str);
+				ha_warning("%s.\n", tmptrash->area);
+				send_log(s->proxy, LOG_NOTICE, "%s.\n",
+					 tmptrash->area);
+				send_email_alert(s, LOG_NOTICE, "%s",
+						 tmptrash->area);
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
@@ -4770,8 +5111,9 @@ void srv_update_status(struct server *s)
 				srv_append_status(tmptrash, s, NULL, -1, (s->next_admin & SRV_ADMF_FMAINT));
 
 				if (!(global.mode & MODE_STARTING)) {
-					ha_warning("%s.\n", tmptrash->str);
-					send_log(s->proxy, LOG_NOTICE, "%s.\n", tmptrash->str);
+					ha_warning("%s.\n", tmptrash->area);
+					send_log(s->proxy, LOG_NOTICE, "%s.\n",
+						 tmptrash->area);
 				}
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
@@ -4808,8 +5150,9 @@ void srv_update_status(struct server *s)
 				srv_append_status(tmptrash, s, NULL, xferred, (s->next_admin & SRV_ADMF_FMAINT));
 
 				if (!(global.mode & MODE_STARTING)) {
-					ha_warning("%s.\n", tmptrash->str);
-					send_log(s->proxy, srv_was_stopping ? LOG_NOTICE : LOG_ALERT, "%s.\n", tmptrash->str);
+					ha_warning("%s.\n", tmptrash->area);
+					send_log(s->proxy, srv_was_stopping ? LOG_NOTICE : LOG_ALERT, "%s.\n",
+						 tmptrash->area);
 				}
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
@@ -4884,13 +5227,14 @@ void srv_update_status(struct server *s)
 					     (s->next_state == SRV_ST_STOPPED) ? "DOWN" : "UP",
 					     (s->next_admin & SRV_ADMF_DRAIN) ? "DRAIN" : "READY");
 			}
-			ha_warning("%s.\n", tmptrash->str);
-			send_log(s->proxy, LOG_NOTICE, "%s.\n", tmptrash->str);
+			ha_warning("%s.\n", tmptrash->area);
+			send_log(s->proxy, LOG_NOTICE, "%s.\n",
+				 tmptrash->area);
 			free_trash_chunk(tmptrash);
 			tmptrash = NULL;
 		}
 
-		server_recalc_eweight(s);
+		server_recalc_eweight(s, 0);
 		/* now propagate the status change to any LB algorithms */
 		if (px->lbprm.update_server_eweight)
 			px->lbprm.update_server_eweight(s);
@@ -4935,8 +5279,9 @@ void srv_update_status(struct server *s)
 				if (s->track) /* normally it's mandatory here */
 					chunk_appendf(tmptrash, " via %s/%s",
 				              s->track->proxy->id, s->track->id);
-				ha_warning("%s.\n", tmptrash->str);
-				send_log(s->proxy, LOG_NOTICE, "%s.\n", tmptrash->str);
+				ha_warning("%s.\n", tmptrash->area);
+				send_log(s->proxy, LOG_NOTICE, "%s.\n",
+					 tmptrash->area);
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
@@ -4952,8 +5297,9 @@ void srv_update_status(struct server *s)
 				if (s->track) /* normally it's mandatory here */
 					chunk_appendf(tmptrash, " via %s/%s",
 				              s->track->proxy->id, s->track->id);
-				ha_warning("%s.\n", tmptrash->str);
-				send_log(s->proxy, LOG_NOTICE, "%s.\n", tmptrash->str);
+				ha_warning("%s.\n", tmptrash->area);
+				send_log(s->proxy, LOG_NOTICE, "%s.\n",
+					 tmptrash->area);
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
@@ -4965,8 +5311,9 @@ void srv_update_status(struct server *s)
 				             "%sServer %s/%s remains in forced maintenance",
 				             s->flags & SRV_F_BACKUP ? "Backup " : "",
 				             s->proxy->id, s->id);
-				ha_warning("%s.\n", tmptrash->str);
-				send_log(s->proxy, LOG_NOTICE, "%s.\n", tmptrash->str);
+				ha_warning("%s.\n", tmptrash->area);
+				send_log(s->proxy, LOG_NOTICE, "%s.\n",
+					 tmptrash->area);
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
@@ -4999,9 +5346,11 @@ void srv_update_status(struct server *s)
 				srv_append_status(tmptrash, s, NULL, xferred, (s->next_admin & SRV_ADMF_FDRAIN));
 
 				if (!(global.mode & MODE_STARTING)) {
-					ha_warning("%s.\n", tmptrash->str);
-					send_log(s->proxy, LOG_NOTICE, "%s.\n", tmptrash->str);
-					send_email_alert(s, LOG_NOTICE, "%s", tmptrash->str);
+					ha_warning("%s.\n", tmptrash->area);
+					send_log(s->proxy, LOG_NOTICE, "%s.\n",
+						 tmptrash->area);
+					send_email_alert(s, LOG_NOTICE, "%s",
+							 tmptrash->area);
 				}
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
@@ -5021,7 +5370,7 @@ void srv_update_status(struct server *s)
 			if (s->last_change < now.tv_sec)                        // ignore negative times
 				s->down_time += now.tv_sec - s->last_change;
 			s->last_change = now.tv_sec;
-			server_recalc_eweight(s);
+			server_recalc_eweight(s, 0);
 
 			tmptrash = alloc_trash_chunk();
 			if (tmptrash) {
@@ -5043,8 +5392,9 @@ void srv_update_status(struct server *s)
 					s->track->proxy->id, s->track->id);
 				}
 
-				ha_warning("%s.\n", tmptrash->str);
-				send_log(s->proxy, LOG_NOTICE, "%s.\n", tmptrash->str);
+				ha_warning("%s.\n", tmptrash->area);
+				send_log(s->proxy, LOG_NOTICE, "%s.\n",
+					 tmptrash->area);
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
@@ -5082,8 +5432,9 @@ void srv_update_status(struct server *s)
 					             s->flags & SRV_F_BACKUP ? "Backup " : "",
 					             s->proxy->id, s->id);
 				}
-				ha_warning("%s.\n", tmptrash->str);
-				send_log(s->proxy, LOG_NOTICE, "%s.\n", tmptrash->str);
+				ha_warning("%s.\n", tmptrash->area);
+				send_log(s->proxy, LOG_NOTICE, "%s.\n",
+					 tmptrash->area);
 				free_trash_chunk(tmptrash);
 				tmptrash = NULL;
 			}
@@ -5097,22 +5448,120 @@ void srv_update_status(struct server *s)
 	/* Re-set log strings to empty */
 	*s->adm_st_chg_cause = 0;
 }
-/*
- * This function loops on servers registered for asynchronous
- * status changes
- *
- * NOTE: No needs to lock <updated_servers> list because it is called inside the
- * sync point.
- */
-void servers_update_status(void) {
-	struct server *s, *stmp;
 
-	list_for_each_entry_safe(s, stmp, &updated_servers, update_status) {
-		srv_update_status(s);
-		LIST_DEL(&s->update_status);
-		LIST_INIT(&s->update_status);
+struct task *srv_cleanup_toremove_connections(struct task *task, void *context, unsigned short state)
+{
+	struct connection *conn;
+
+	while ((conn = LIST_POP_LOCKED(&toremove_connections[tid],
+	                               struct connection *, list)) != NULL) {
+		conn->mux->destroy(conn->ctx);
 	}
+
+	return task;
 }
+
+struct task *srv_cleanup_idle_connections(struct task *task, void *context, unsigned short state)
+{
+	struct server *srv;
+	struct eb32_node *eb;
+	int i;
+	unsigned int next_wakeup;
+	int need_wakeup = 0;
+
+	HA_SPIN_LOCK(OTHER_LOCK, &idle_conn_srv_lock);
+	while (1) {
+		int srv_is_empty = 1;
+
+		eb = eb32_lookup_ge(&idle_conn_srv, now_ms - TIMER_LOOK_BACK);
+		if (!eb) {
+			/* we might have reached the end of the tree, typically because
+			 * <now_ms> is in the first half and we're first scanning the last
+			* half. Let's loop back to the beginning of the tree now.
+			*/
+
+			eb = eb32_first(&idle_conn_srv);
+			if (likely(!eb))
+				break;
+		}
+		if (tick_is_lt(now_ms, eb->key)) {
+			/* timer not expired yet, revisit it later */
+			next_wakeup = eb->key;
+			need_wakeup = 1;
+			break;
+		}
+		srv = eb32_entry(eb, struct server, idle_node);
+		for (i = 0; i < global.nbthread; i++) {
+			int max_conn = (srv->curr_idle_thr[i] / 2) +
+			    (srv->curr_idle_thr[i] & 1);
+			int j;
+			int did_remove = 0;
+
+			for (j = 0; j < max_conn; j++) {
+				struct connection *conn = LIST_POP_LOCKED(&srv->idle_orphan_conns[i], struct connection *, list);
+				if (!conn)
+					break;
+				did_remove = 1;
+				LIST_ADDQ_LOCKED(&toremove_connections[i], &conn->list);
+			}
+			if (did_remove && max_conn < srv->curr_idle_thr[i])
+				srv_is_empty = 0;
+			if (did_remove)
+				task_wakeup(idle_conn_cleanup[i], TASK_WOKEN_OTHER);
+		}
+		eb32_delete(&srv->idle_node);
+		if (!srv_is_empty) {
+			/* There are still more idle connections, add the
+			 * server back in the tree.
+			 */
+			srv->idle_node.key = tick_add(srv->pool_purge_delay,
+			    now_ms);
+			eb32_insert(&idle_conn_srv, &srv->idle_node);
+		}
+	}
+	HA_SPIN_UNLOCK(OTHER_LOCK, &idle_conn_srv_lock);
+
+	if (need_wakeup)
+		task->expire = next_wakeup;
+	else
+		task->expire = TICK_ETERNITY;
+
+	return task;
+}
+
+/* config parser for global "tune.pool-{low,high}-fd-ratio" */
+static int cfg_parse_pool_fd_ratio(char **args, int section_type, struct proxy *curpx,
+                                   struct proxy *defpx, const char *file, int line,
+                                   char **err)
+{
+	int arg = -1;
+
+	if (too_many_args(1, args, err, NULL))
+		return -1;
+
+	if (*(args[1]) != 0)
+		arg = atoi(args[1]);
+
+	if (arg < 0 || arg > 100) {
+		memprintf(err, "'%s' expects an integer argument between 0 and 100.", args[0]);
+		return -1;
+	}
+
+	if (args[0][10] == 'h')
+		global.tune.pool_high_ratio = arg;
+	else
+		global.tune.pool_low_ratio = arg;
+	return 0;
+}
+
+/* config keyword parsers */
+static struct cfg_kw_list cfg_kws = {ILH, {
+	{ CFG_GLOBAL, "tune.pool-high-fd-ratio",     cfg_parse_pool_fd_ratio },
+	{ CFG_GLOBAL, "tune.pool-low-fd-ratio",      cfg_parse_pool_fd_ratio },
+	{ 0, NULL, NULL }
+}};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &cfg_kws);
 
 /*
  * Local variables:

@@ -25,10 +25,10 @@
 #include <netinet/in.h>
 
 #include <common/config.h>
-#include <common/standard.h>
+#include <common/initcall.h>
 #include <common/hathreads.h>
+#include <common/standard.h>
 
-#include <types/freq_ctr.h>
 #include <types/listener.h>
 #include <types/proxy.h>
 #include <types/task.h>
@@ -47,6 +47,7 @@
 #define	MODE_STARTING	0x20
 #define	MODE_FOREGROUND	0x40
 #define	MODE_MWORKER	0x80    /* Master Worker */
+#define	MODE_MWORKER_WAIT	0x100    /* Master Worker wait mode */
 
 /* list of last checks to perform, depending on config options */
 #define LSTCHK_CAP_BIND	0x00000001	/* check that we can bind to any port */
@@ -68,6 +69,12 @@
 #define GTUNE_NOEXIT_ONFAILURE   (1<<9)
 #define GTUNE_USE_SYSTEMD        (1<<10)
 
+#define GTUNE_BUSY_POLLING       (1<<11)
+#define GTUNE_LISTENER_MQ        (1<<12)
+#define GTUNE_SET_DUMPABLE       (1<<13)
+
+#define GTUNE_USE_EVPORTS        (1<<14)
+
 /* Access level for a stats socket */
 #define ACCESS_LVL_NONE     0
 #define ACCESS_LVL_USER     1
@@ -76,6 +83,8 @@
 #define ACCESS_LVL_MASK     0x3
 
 #define ACCESS_FD_LISTENERS 0x4  /* expose listeners FDs on stats socket */
+#define ACCESS_MASTER       0x8  /* works with the master (and every other processes) */
+#define ACCESS_MASTER_ONLY  0x10 /* only works with the worker */
 
 /* SSL server verify mode */
 enum {
@@ -106,6 +115,8 @@ struct global {
 	struct freq_ctr ssl_be_keys_per_sec;
 	struct freq_ctr comp_bps_in;	/* bytes per second, before http compression */
 	struct freq_ctr comp_bps_out;	/* bytes per second, after http compression */
+	struct freq_ctr out_32bps;      /* #of 32-byte blocks emitted per second */
+	unsigned long long out_bytes;   /* total #of bytes emitted */
 	int cps_lim, cps_max;
 	int sps_lim, sps_max;
 	int ssl_lim, ssl_max;
@@ -127,7 +138,7 @@ struct global {
 	char *chroot;
 	char *pidfile;
 	char *node, *desc;		/* node name & description */
-	struct chunk log_tag;           /* name for syslog */
+	struct buffer log_tag;           /* name for syslog */
 	struct list logsrvs;
 	char *log_send_hostname;   /* set hostname in syslog header */
 	char *server_state_base;   /* path to a directory where server state files can be found */
@@ -136,6 +147,7 @@ struct global {
 		int maxpollevents; /* max number of poll events at once */
 		int maxaccept;     /* max number of consecutive accept() */
 		int options;       /* various tuning options */
+		int runqueue_depth;/* max number of tasks to run at once */
 		int recv_enough;   /* how many input bytes at once are "enough" */
 		int bufsize;       /* buffer size in bytes, defaults to BUFSIZE */
 		int maxrewrite;    /* buffer max rewrite size in bytes, defaults to MAXREWRITE */
@@ -153,6 +165,10 @@ struct global {
 		int pattern_cache; /* max number of entries in the pattern cache. */
 		int sslcachesize;  /* SSL cache size in session, defaults to 20000 */
 		int comp_maxlevel;    /* max HTTP compression level */
+		int pool_low_ratio;   /* max ratio of FDs used before we stop using new idle connections */
+		int pool_high_ratio;  /* max ratio of FDs used before we start killing idle connections when creating new connections */
+		int pool_low_count;   /* max number of opened fd before we stop using new idle connections */
+		int pool_high_count;  /* max number of opened fd before we start killing idle connections when creating new connections */
 		unsigned short idle_timer; /* how long before an empty buffer is considered idle (ms) */
 	} tune;
 	struct {
@@ -167,58 +183,70 @@ struct global {
 	struct vars   vars;         /* list of variables for the process scope. */
 #ifdef USE_CPU_AFFINITY
 	struct {
-		unsigned long proc[LONGBITS];             /* list of CPU masks for the 32/64 first processes */
-		unsigned long thread[LONGBITS][MAX_THREADS]; /* list of CPU masks for the 32/64 first threads per process */
+		unsigned long proc[MAX_PROCS];      /* list of CPU masks for the 32/64 first processes */
+		unsigned long thread[MAX_THREADS];  /* list of CPU masks for the 32/64 first threads */
 	} cpu_map;
 #endif
 };
 
-/* per-thread activity reports. It's important that it's aligned on cache lines
- * because some elements will be updated very often. Most counters are OK on
- * 32-bit since this will be used during debugging sessions for troubleshooting
- * in iterative mode.
+/* options for mworker_proc */
+
+#define PROC_O_TYPE_MASTER           0x00000001
+#define PROC_O_TYPE_WORKER           0x00000002
+#define PROC_O_TYPE_PROG             0x00000004
+/* 0x00000008 unused */
+#define PROC_O_LEAVING               0x00000010  /* this process should be leaving */
+/* 0x00000020 to 0x00000080 unused */
+#define PROC_O_START_RELOAD          0x00000100  /* Start the process even if the master was re-executed */
+
+/*
+ * Structure used to describe the processes in master worker mode
  */
-struct activity {
-	unsigned int loops;        // complete loops in run_poll_loop()
-	unsigned int wake_cache;   // active fd_cache prevented poll() from sleeping
-	unsigned int wake_tasks;   // active tasks prevented poll() from sleeping
-	unsigned int wake_applets; // active applets prevented poll() from sleeping
-	unsigned int wake_signal;  // pending signal prevented poll() from sleeping
-	unsigned int poll_exp;     // number of times poll() sees an expired timeout (includes wake_*)
-	unsigned int poll_drop;    // poller dropped a dead FD from the update list
-	unsigned int poll_dead;    // poller woke up with a dead FD
-	unsigned int poll_skip;    // poller skipped another thread's FD
-	unsigned int fd_skip;      // fd cache skipped another thread's FD
-	unsigned int fd_lock;      // fd cache skipped a locked FD
-	unsigned int fd_del;       // fd cache detected a deleted FD
-	unsigned int conn_dead;    // conn_fd_handler woke up on an FD indicating a dead connection
-	unsigned int stream;       // calls to process_stream()
-	unsigned int empty_rq;     // calls to process_runnable_tasks() with nothing for the thread
-	unsigned int long_rq;      // process_runnable_tasks() left with tasks in the run queue
-	char __pad[0]; // unused except to check remaining room
-	char __end[0] __attribute__((aligned(64))); // align size to 64.
+struct mworker_proc {
+	int pid;
+	int options;
+	char *id;
+	char **command;
+	char *path;
+	char *version;
+	int ipc_fd[2]; /* 0 is master side, 1 is worker side */
+	int relative_pid;
+	int reloads;
+	int timestamp;
+	struct server *srv; /* the server entry in the master proxy */
+	struct list list;
 };
 
 extern struct global global;
-extern struct activity activity[MAX_THREADS];
 extern int  pid;                /* current process id */
 extern int  relative_pid;       /* process id starting at 1 */
 extern unsigned long pid_bit;   /* bit corresponding to the process id */
+extern unsigned long all_proc_mask; /* mask of all processes */
 extern int  actconn;            /* # of active sessions */
 extern int  listeners;
 extern int  jobs;               /* # of active jobs (listeners, sessions, open devices) */
-extern THREAD_LOCAL struct chunk trash;
+extern int  unstoppable_jobs;   /* # of active jobs that can't be stopped during a soft stop */
+extern int  active_peers;       /* # of active peers (connection attempts and successes) */
+extern int  connected_peers;    /* # of really connected peers */
+extern THREAD_LOCAL struct buffer trash;
 extern int nb_oldpids;          /* contains the number of old pids found */
 extern const int zero;
 extern const int one;
 extern const struct linger nolinger;
 extern int stopping;	/* non zero means stopping in progress */
-extern int killed;	/* non zero means a hard-stop is triggered */
+extern int killed;	/* >0 means a hard-stop is triggered, >1 means hard-stop immediately */
 extern char hostname[MAX_HOSTNAME_LEN];
 extern char localpeer[MAX_HOSTNAME_LEN];
 extern struct list global_listener_queue; /* list of the temporarily limited listeners */
 extern struct task *global_listener_queue_task;
 extern unsigned int warned;     /* bitfield of a few warnings to emit just once */
+extern volatile unsigned long sleeping_thread_mask;
+extern struct list proc_list; /* list of process in mworker mode */
+extern struct mworker_proc *proc_self; /* process structure of current process */
+extern int master; /* 1 if in master, 0 otherwise */
+extern unsigned int rlim_fd_cur_at_boot;
+extern unsigned int rlim_fd_max_at_boot;
+extern int atexit_flag;
 
 /* bit values to go with "warned" above */
 #define WARN_BLOCK_DEPRECATED       0x00000001
@@ -227,6 +255,19 @@ extern unsigned int warned;     /* bitfield of a few warnings to emit just once 
 #define WARN_CLITO_DEPRECATED       0x00000008
 #define WARN_SRVTO_DEPRECATED       0x00000010
 #define WARN_CONTO_DEPRECATED       0x00000020
+#define WARN_FORCECLOSE_DEPRECATED  0x00000040
+
+#define WARN_REQREP_DEPRECATED      0x00000080
+#define WARN_REQDEL_DEPRECATED      0x00000100
+#define WARN_REQDENY_DEPRECATED     0x00000200
+#define WARN_REQPASS_DEPRECATED     0x00000400
+#define WARN_REQALLOW_DEPRECATED    0x00000800
+#define WARN_REQTARPIT_DEPRECATED   0x00001000
+#define WARN_REQADD_DEPRECATED      0x00002000
+#define WARN_RSPREP_DEPRECATED      0x00004000
+#define WARN_RSPDEL_DEPRECATED      0x00008000
+#define WARN_RSPDENY_DEPRECATED     0x00010000
+#define WARN_RSPADD_DEPRECATED      0x00020000
 
 /* to be used with warned and WARN_* */
 static inline int already_warned(unsigned int warning)
@@ -237,13 +278,61 @@ static inline int already_warned(unsigned int warning)
 	return 0;
 }
 
+/* returns a mask if set, otherwise all_proc_mask */
+static inline unsigned long proc_mask(unsigned long mask)
+{
+	return mask ? mask : all_proc_mask;
+}
+
+/* returns a mask if set, otherwise all_threads_mask */
+static inline unsigned long thread_mask(unsigned long mask)
+{
+	return mask ? mask : all_threads_mask;
+}
+
+int tell_old_pids(int sig);
+int delete_oldpid(int pid);
+
 void deinit(void);
 void hap_register_build_opts(const char *str, int must_free);
 void hap_register_post_check(int (*fct)());
 void hap_register_post_deinit(void (*fct)());
 
+void hap_register_per_thread_alloc(int (*fct)());
 void hap_register_per_thread_init(int (*fct)());
 void hap_register_per_thread_deinit(void (*fct)());
+void hap_register_per_thread_free(int (*fct)());
+
+void mworker_accept_wrapper(int fd);
+void mworker_reload();
+
+/* simplified way to declare static build options in a file */
+#define REGISTER_BUILD_OPTS(str) \
+	INITCALL2(STG_REGISTER, hap_register_build_opts, (str), 0)
+
+/* simplified way to declare a post-check callback in a file */
+#define REGISTER_POST_CHECK(fct) \
+	INITCALL1(STG_REGISTER, hap_register_post_check, (fct))
+
+/* simplified way to declare a post-deinit callback in a file */
+#define REGISTER_POST_DEINIT(fct) \
+	INITCALL1(STG_REGISTER, hap_register_post_deinit, (fct))
+
+/* simplified way to declare a per-thread allocation callback in a file */
+#define REGISTER_PER_THREAD_ALLOC(fct) \
+	INITCALL1(STG_REGISTER, hap_register_per_thread_alloc, (fct))
+
+/* simplified way to declare a per-thread init callback in a file */
+#define REGISTER_PER_THREAD_INIT(fct) \
+	INITCALL1(STG_REGISTER, hap_register_per_thread_init, (fct))
+
+/* simplified way to declare a per-thread deinit callback in a file */
+#define REGISTER_PER_THREAD_DEINIT(fct) \
+	INITCALL1(STG_REGISTER, hap_register_per_thread_deinit, (fct))
+
+/* simplified way to declare a per-thread free callback in a file */
+#define REGISTER_PER_THREAD_FREE(fct) \
+	INITCALL1(STG_REGISTER, hap_register_per_thread_free, (fct))
 
 #endif /* _TYPES_GLOBAL_H */
 

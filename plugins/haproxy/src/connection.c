@@ -14,7 +14,10 @@
 
 #include <common/compat.h>
 #include <common/config.h>
+#include <common/initcall.h>
 #include <common/namespace.h>
+#include <common/hash.h>
+#include <common/net_helper.h>
 
 #include <proto/connection.h>
 #include <proto/fd.h>
@@ -22,38 +25,19 @@
 #include <proto/proto_tcp.h>
 #include <proto/stream_interface.h>
 #include <proto/sample.h>
-
-#ifdef USE_OPENSSL
 #include <proto/ssl_sock.h>
-#endif
 
-struct pool_head *pool_head_connection;
-struct pool_head *pool_head_connstream;
+#include <common/debug.h>
+
+DECLARE_POOL(pool_head_connection, "connection",  sizeof(struct connection));
+DECLARE_POOL(pool_head_connstream, "conn_stream", sizeof(struct conn_stream));
+
 struct xprt_ops *registered_xprt[XPRT_ENTRIES] = { NULL, };
 
-/* List head of all known muxes for ALPN */
-struct alpn_mux_list alpn_mux_list = {
-        .list = LIST_HEAD_INIT(alpn_mux_list.list)
+/* List head of all known muxes for PROTO */
+struct mux_proto_list mux_proto_list = {
+        .list = LIST_HEAD_INIT(mux_proto_list.list)
 };
-
-/* perform minimal intializations, report 0 in case of error, 1 if OK. */
-int init_connection()
-{
-	pool_head_connection = create_pool("connection", sizeof (struct connection), MEM_F_SHARED);
-	if (!pool_head_connection)
-		goto fail_conn;
-
-	pool_head_connstream = create_pool("conn_stream", sizeof(struct conn_stream), MEM_F_SHARED);
-	if (!pool_head_connstream)
-		goto fail_cs;
-
-	return 1;
- fail_cs:
-	pool_destroy(pool_head_connection);
-	pool_head_connection = NULL;
- fail_conn:
-	return 0;
-}
 
 /* I/O callback for fd-based connections. It calls the read/write handlers
  * provided by the connection's sock_ops, which must be valid.
@@ -62,6 +46,7 @@ void conn_fd_handler(int fd)
 {
 	struct connection *conn = fdtab[fd].owner;
 	unsigned int flags;
+	int io_available = 0;
 
 	if (unlikely(!conn)) {
 		activity[tid].conn_dead++;
@@ -73,41 +58,6 @@ void conn_fd_handler(int fd)
 
 	flags = conn->flags & ~CO_FL_ERROR; /* ensure to call the wake handler upon error */
 
- process_handshake:
-	/* The handshake callbacks are called in sequence. If either of them is
-	 * missing something, it must enable the required polling at the socket
-	 * layer of the connection. Polling state is not guaranteed when entering
-	 * these handlers, so any handshake handler which does not complete its
-	 * work must explicitly disable events it's not interested in. Error
-	 * handling is also performed here in order to reduce the number of tests
-	 * around.
-	 */
-	while (unlikely(conn->flags & (CO_FL_HANDSHAKE | CO_FL_ERROR))) {
-		if (unlikely(conn->flags & CO_FL_ERROR))
-			goto leave;
-
-		if (conn->flags & CO_FL_ACCEPT_CIP)
-			if (!conn_recv_netscaler_cip(conn, CO_FL_ACCEPT_CIP))
-				goto leave;
-
-		if (conn->flags & CO_FL_ACCEPT_PROXY)
-			if (!conn_recv_proxy(conn, CO_FL_ACCEPT_PROXY))
-				goto leave;
-
-		if (conn->flags & CO_FL_SEND_PROXY)
-			if (!conn_si_send_proxy(conn, CO_FL_SEND_PROXY))
-				goto leave;
-#ifdef USE_OPENSSL
-		if (conn->flags & CO_FL_SSL_WAIT_HS)
-			if (!ssl_sock_handshake(conn, CO_FL_SSL_WAIT_HS))
-				goto leave;
-#endif
-	}
-
-	/* Once we're purely in the data phase, we disable handshake polling */
-	if (!(conn->flags & CO_FL_POLL_SOCK))
-		__conn_sock_stop_both(conn);
-
 	/* The connection owner might want to be notified about an end of
 	 * handshake indicating the connection is ready, before we proceed with
 	 * any data exchange. The callback may fail and cause the connection to
@@ -115,38 +65,43 @@ void conn_fd_handler(int fd)
 	 * leave instead. The caller must immediately unregister itself once
 	 * called.
 	 */
-	if (conn->xprt_done_cb && conn->xprt_done_cb(conn) < 0)
+	if (!(conn->flags & CO_FL_HANDSHAKE) &&
+	    conn->xprt_done_cb && conn->xprt_done_cb(conn) < 0)
 		return;
 
-	if (conn->xprt && fd_send_ready(fd) &&
-	    ((conn->flags & (CO_FL_XPRT_WR_ENA|CO_FL_ERROR|CO_FL_HANDSHAKE)) == CO_FL_XPRT_WR_ENA)) {
+	if (conn->xprt && fd_send_ready(fd)) {
 		/* force reporting of activity by clearing the previous flags :
 		 * we'll have at least ERROR or CONNECTED at the end of an I/O,
 		 * both of which will be detected below.
 		 */
 		flags = 0;
-		conn->mux->send(conn);
+		if (conn->send_wait != NULL) {
+			conn->send_wait->events &= ~SUB_RETRY_SEND;
+			tasklet_wakeup(conn->send_wait->tasklet);
+			conn->send_wait = NULL;
+		} else
+			io_available = 1;
+		__conn_xprt_stop_send(conn);
 	}
 
 	/* The data transfer starts here and stops on error and handshakes. Note
 	 * that we must absolutely test conn->xprt at each step in case it suddenly
 	 * changes due to a quick unexpected close().
 	 */
-	if (conn->xprt && fd_recv_ready(fd) &&
-	    ((conn->flags & (CO_FL_XPRT_RD_ENA|CO_FL_WAIT_ROOM|CO_FL_ERROR|CO_FL_HANDSHAKE)) == CO_FL_XPRT_RD_ENA)) {
+	if (conn->xprt && fd_recv_ready(fd)) {
 		/* force reporting of activity by clearing the previous flags :
 		 * we'll have at least ERROR or CONNECTED at the end of an I/O,
 		 * both of which will be detected below.
 		 */
 		flags = 0;
-		conn->mux->recv(conn);
+		if (conn->recv_wait) {
+			conn->recv_wait->events &= ~SUB_RETRY_RECV;
+			tasklet_wakeup(conn->recv_wait->tasklet);
+			conn->recv_wait = NULL;
+		} else
+			io_available = 1;
+		__conn_xprt_stop_recv(conn);
 	}
-
-	/* It may happen during the data phase that a handshake is
-	 * enabled again (eg: SSL)
-	 */
-	if (unlikely(conn->flags & (CO_FL_HANDSHAKE | CO_FL_ERROR)))
-		goto process_handshake;
 
 	if (unlikely(conn->flags & CO_FL_WAIT_L4_CONN)) {
 		/* still waiting for a connection to establish and nothing was
@@ -186,14 +141,11 @@ void conn_fd_handler(int fd)
 	 * Note that the wake callback is allowed to release the connection and
 	 * the fd (and return < 0 in this case).
 	 */
-	if ((((conn->flags ^ flags) & CO_FL_NOTIFY_DATA) ||
+	if ((io_available || (((conn->flags ^ flags) & CO_FL_NOTIFY_DATA) ||
 	     ((flags & (CO_FL_CONNECTED|CO_FL_HANDSHAKE)) != CO_FL_CONNECTED &&
-	      (conn->flags & (CO_FL_CONNECTED|CO_FL_HANDSHAKE)) == CO_FL_CONNECTED)) &&
-	    conn->mux->wake(conn) < 0)
+	      (conn->flags & (CO_FL_CONNECTED|CO_FL_HANDSHAKE)) == CO_FL_CONNECTED))) &&
+	    conn->mux && conn->mux->wake && conn->mux->wake(conn) < 0)
 		return;
-
-	/* remove the events before leaving */
-	fdtab[fd].ev &= FD_POLL_STICKY;
 
 	/* commit polling changes */
 	conn->flags &= ~CO_FL_WILL_UPDATE;
@@ -230,41 +182,6 @@ void conn_update_xprt_polling(struct connection *c)
 		f |= CO_FL_CURR_WR_ENA;
 	}
 	else if (unlikely((f & (CO_FL_CURR_WR_ENA|CO_FL_XPRT_WR_ENA)) == CO_FL_CURR_WR_ENA)) {
-		fd_stop_send(c->handle.fd);
-		f &= ~CO_FL_CURR_WR_ENA;
-	}
-	c->flags = f;
-}
-
-/* Update polling on connection <c>'s file descriptor depending on its current
- * state as reported in the connection's CO_FL_CURR_* flags, reports of EAGAIN
- * in CO_FL_WAIT_*, and the sock layer expectations indicated by CO_FL_SOCK_*.
- * The connection flags are updated with the new flags at the end of the
- * operation. Polling is totally disabled if an error was reported.
- */
-void conn_update_sock_polling(struct connection *c)
-{
-	unsigned int f = c->flags;
-
-	if (!conn_ctrl_ready(c))
-		return;
-
-	/* update read status if needed */
-	if (unlikely((f & (CO_FL_CURR_RD_ENA|CO_FL_SOCK_RD_ENA)) == CO_FL_SOCK_RD_ENA)) {
-		fd_want_recv(c->handle.fd);
-		f |= CO_FL_CURR_RD_ENA;
-	}
-	else if (unlikely((f & (CO_FL_CURR_RD_ENA|CO_FL_SOCK_RD_ENA)) == CO_FL_CURR_RD_ENA)) {
-		fd_stop_recv(c->handle.fd);
-		f &= ~CO_FL_CURR_RD_ENA;
-	}
-
-	/* update write status if needed */
-	if (unlikely((f & (CO_FL_CURR_WR_ENA|CO_FL_SOCK_WR_ENA)) == CO_FL_SOCK_WR_ENA)) {
-		fd_want_send(c->handle.fd);
-		f |= CO_FL_CURR_WR_ENA;
-	}
-	else if (unlikely((f & (CO_FL_CURR_WR_ENA|CO_FL_SOCK_WR_ENA)) == CO_FL_CURR_WR_ENA)) {
 		fd_stop_send(c->handle.fd);
 		f &= ~CO_FL_CURR_WR_ENA;
 	}
@@ -321,6 +238,54 @@ int conn_sock_send(struct connection *conn, const void *buf, int len, int flags)
 	return ret;
 }
 
+int conn_unsubscribe(struct connection *conn, void *xprt_ctx, int event_type, void *param)
+{
+	struct wait_event *sw;
+
+	if (event_type & SUB_RETRY_RECV) {
+		sw = param;
+		BUG_ON(conn->recv_wait != sw);
+		conn->recv_wait = NULL;
+		sw->events &= ~SUB_RETRY_RECV;
+		__conn_xprt_stop_recv(conn);
+	}
+	if (event_type & SUB_RETRY_SEND) {
+		sw = param;
+		BUG_ON(conn->send_wait != sw);
+		conn->send_wait = NULL;
+		sw->events &= ~SUB_RETRY_SEND;
+		__conn_xprt_stop_send(conn);
+	}
+	conn_update_xprt_polling(conn);
+	return 0;
+}
+
+int conn_subscribe(struct connection *conn, void *xprt_ctx, int event_type, void *param)
+{
+	struct wait_event *sw;
+
+	if (event_type & SUB_RETRY_RECV) {
+		sw = param;
+		BUG_ON(conn->recv_wait != NULL || (sw->events & SUB_RETRY_RECV));
+		sw->events |= SUB_RETRY_RECV;
+		conn->recv_wait = sw;
+		event_type &= ~SUB_RETRY_RECV;
+		__conn_xprt_want_recv(conn);
+	}
+	if (event_type & SUB_RETRY_SEND) {
+		sw = param;
+		BUG_ON(conn->send_wait != NULL || (sw->events & SUB_RETRY_SEND));
+		sw->events |= SUB_RETRY_SEND;
+		conn->send_wait = sw;
+		event_type &= ~SUB_RETRY_SEND;
+		__conn_xprt_want_send(conn);
+	}
+	if (event_type != 0)
+		return (-1);
+	conn_update_xprt_polling(conn);
+	return 0;
+}
+
 /* Drains possibly pending incoming data on the file descriptor attached to the
  * connection and update the connection's flags accordingly. This is used to
  * know whether we need to disable lingering on close. Returns non-zero if it
@@ -330,29 +295,61 @@ int conn_sock_send(struct connection *conn, const void *buf, int len, int flags)
  */
 int conn_sock_drain(struct connection *conn)
 {
+	int turns = 2;
+	int len;
+
 	if (!conn_ctrl_ready(conn))
 		return 1;
 
 	if (conn->flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH))
 		return 1;
 
-	if (fdtab[conn->handle.fd].ev & (FD_POLL_ERR|FD_POLL_HUP)) {
-		fdtab[conn->handle.fd].linger_risk = 0;
-	}
-	else {
-		if (!fd_recv_ready(conn->handle.fd))
-			return 0;
+	if (fdtab[conn->handle.fd].ev & (FD_POLL_ERR|FD_POLL_HUP))
+		goto shut;
 
-		/* disable draining if we were called and have no drain function */
-		if (!conn->ctrl->drain) {
-			__conn_xprt_stop_recv(conn);
-			return 0;
-		}
+	if (!fd_recv_ready(conn->handle.fd))
+		return 0;
 
+	if (conn->ctrl->drain) {
 		if (conn->ctrl->drain(conn->handle.fd) <= 0)
 			return 0;
+		goto shut;
 	}
 
+	/* no drain function defined, use the generic one */
+
+	while (turns) {
+#ifdef MSG_TRUNC_CLEARS_INPUT
+		len = recv(conn->handle.fd, NULL, INT_MAX, MSG_DONTWAIT | MSG_NOSIGNAL | MSG_TRUNC);
+		if (len == -1 && errno == EFAULT)
+#endif
+			len = recv(conn->handle.fd, trash.area, trash.size,
+				   MSG_DONTWAIT | MSG_NOSIGNAL);
+
+		if (len == 0)
+			goto shut;
+
+		if (len < 0) {
+			if (errno == EAGAIN) {
+				/* connection not closed yet */
+				fd_cant_recv(conn->handle.fd);
+				break;
+			}
+			if (errno == EINTR)  /* oops, try again */
+				continue;
+			/* other errors indicate a dead connection, fine. */
+			goto shut;
+		}
+		/* OK we read some data, let's try again once */
+		turns--;
+	}
+
+	/* some data are still present, give up */
+	return 0;
+
+ shut:
+	/* we're certain the connection was shut down */
+	fdtab[conn->handle.fd].linger_risk = 0;
 	conn->flags |= CO_FL_SOCK_RD_SH;
 	return 1;
 }
@@ -395,6 +392,7 @@ int conn_recv_proxy(struct connection *conn, int flag)
 	const char v2sig[] = PP2_SIGNATURE;
 	int tlv_length = 0;
 	int tlv_offset = 0;
+	int ret;
 
 	/* we might have been called just after an asynchronous shutr */
 	if (conn->flags & CO_FL_SOCK_RD_SH)
@@ -404,39 +402,40 @@ int conn_recv_proxy(struct connection *conn, int flag)
 		goto fail;
 
 	if (!fd_recv_ready(conn->handle.fd))
-		return 0;
+		goto not_ready;
 
 	do {
-		trash.len = recv(conn->handle.fd, trash.str, trash.size, MSG_PEEK);
-		if (trash.len < 0) {
+		ret = recv(conn->handle.fd, trash.area, trash.size, MSG_PEEK);
+		if (ret < 0) {
 			if (errno == EINTR)
 				continue;
 			if (errno == EAGAIN) {
 				fd_cant_recv(conn->handle.fd);
-				return 0;
+				goto not_ready;
 			}
 			goto recv_abort;
 		}
+		trash.data = ret;
 	} while (0);
 
-	if (!trash.len) {
+	if (!trash.data) {
 		/* client shutdown */
 		conn->err_code = CO_ER_PRX_EMPTY;
 		goto fail;
 	}
 
-	if (trash.len < 6)
+	if (trash.data < 6)
 		goto missing;
 
-	line = trash.str;
-	end = trash.str + trash.len;
+	line = trash.area;
+	end = trash.area + trash.data;
 
 	/* Decode a possible proxy request, fail early if it does not match */
 	if (strncmp(line, "PROXY ", 6) != 0)
 		goto not_v1;
 
 	line += 6;
-	if (trash.len < 9) /* shortest possible line */
+	if (trash.data < 9) /* shortest possible line */
 		goto missing;
 
 	if (memcmp(line, "TCP4 ", 5) == 0) {
@@ -551,15 +550,15 @@ int conn_recv_proxy(struct connection *conn, int flag)
 		goto fail;
 	}
 
-	trash.len = line - trash.str;
+	trash.data = line - trash.area;
 	goto eat_header;
 
  not_v1:
 	/* try PPv2 */
-	if (trash.len < PP2_HEADER_LEN)
+	if (trash.data < PP2_HEADER_LEN)
 		goto missing;
 
-	hdr_v2 = (struct proxy_hdr_v2 *)trash.str;
+	hdr_v2 = (struct proxy_hdr_v2 *) trash.area;
 
 	if (memcmp(hdr_v2->sig, v2sig, PP2_SIGNATURE_LEN) != 0 ||
 	    (hdr_v2->ver_cmd & PP2_VERSION_MASK) != PP2_VERSION) {
@@ -567,7 +566,7 @@ int conn_recv_proxy(struct connection *conn, int flag)
 		goto fail;
 	}
 
-	if (trash.len < PP2_HEADER_LEN + ntohs(hdr_v2->len))
+	if (trash.data < PP2_HEADER_LEN + ntohs(hdr_v2->len))
 		goto missing;
 
 	switch (hdr_v2->ver_cmd & PP2_CMD_MASK) {
@@ -605,13 +604,21 @@ int conn_recv_proxy(struct connection *conn, int flag)
 
 		/* TLV parsing */
 		if (tlv_length > 0) {
-			while (tlv_offset + TLV_HEADER_SIZE <= trash.len) {
-				const struct tlv *tlv_packet = (struct tlv *) &trash.str[tlv_offset];
+			while (tlv_offset + TLV_HEADER_SIZE <= trash.data) {
+				const struct tlv *tlv_packet = (struct tlv *) &trash.area[tlv_offset];
 				const int tlv_len = get_tlv_length(tlv_packet);
 				tlv_offset += tlv_len + TLV_HEADER_SIZE;
 
 				switch (tlv_packet->type) {
-#ifdef CONFIG_HAP_NS
+				case PP2_TYPE_CRC32C: {
+					void *tlv_crc32c_p = (void *)tlv_packet->value;
+					uint32_t n_crc32c = ntohl(read_u32(tlv_crc32c_p));
+					write_u32(tlv_crc32c_p, 0);
+					if (hash_crc32c(trash.area, PP2_HEADER_LEN + ntohs(hdr_v2->len)) != n_crc32c)
+						goto bad_header;
+					break;
+				}
+#ifdef USE_NS
 				case PP2_TYPE_NETNS: {
 					const struct netns_entry *ns;
 					ns = netns_store_lookup((char*)tlv_packet->value, tlv_len);
@@ -635,7 +642,7 @@ int conn_recv_proxy(struct connection *conn, int flag)
 		goto bad_header; /* not a supported command */
 	}
 
-	trash.len = PP2_HEADER_LEN + ntohs(hdr_v2->len);
+	trash.data = PP2_HEADER_LEN + ntohs(hdr_v2->len);
 	goto eat_header;
 
  eat_header:
@@ -644,16 +651,19 @@ int conn_recv_proxy(struct connection *conn, int flag)
 	 * fail.
 	 */
 	do {
-		int len2 = recv(conn->handle.fd, trash.str, trash.len, 0);
+		int len2 = recv(conn->handle.fd, trash.area, trash.data, 0);
 		if (len2 < 0 && errno == EINTR)
 			continue;
-		if (len2 != trash.len)
+		if (len2 != trash.data)
 			goto recv_abort;
 	} while (0);
 
 	conn->flags &= ~flag;
 	conn->flags |= CO_FL_RCVD_PROXY;
 	return 1;
+
+ not_ready:
+	return 0;
 
  missing:
 	/* Missing data. Since we're using MSG_PEEK, we can only poll again if
@@ -674,7 +684,6 @@ int conn_recv_proxy(struct connection *conn, int flag)
 	goto fail;
 
  fail:
-	__conn_sock_stop_both(conn);
 	conn->flags |= CO_FL_ERROR;
 	return 0;
 }
@@ -699,7 +708,8 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 {
 	char *line;
 	uint32_t hdr_len;
-	uint8_t ip_v;
+	uint8_t ip_ver;
+	int ret;
 
 	/* we might have been called just after an asynchronous shutr */
 	if (conn->flags & CO_FL_SOCK_RD_SH)
@@ -709,22 +719,23 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 		goto fail;
 
 	if (!fd_recv_ready(conn->handle.fd))
-		return 0;
+		goto not_ready;
 
 	do {
-		trash.len = recv(conn->handle.fd, trash.str, trash.size, MSG_PEEK);
-		if (trash.len < 0) {
+		ret = recv(conn->handle.fd, trash.area, trash.size, MSG_PEEK);
+		if (ret < 0) {
 			if (errno == EINTR)
 				continue;
 			if (errno == EAGAIN) {
 				fd_cant_recv(conn->handle.fd);
-				return 0;
+				goto not_ready;
 			}
 			goto recv_abort;
 		}
+		trash.data = ret;
 	} while (0);
 
-	if (!trash.len) {
+	if (!trash.data) {
 		/* client shutdown */
 		conn->err_code = CO_ER_CIP_EMPTY;
 		goto fail;
@@ -733,23 +744,23 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 	/* Fail if buffer length is not large enough to contain
 	 * CIP magic, header length or
 	 * CIP magic, CIP length, CIP type, header length */
-	if (trash.len < 12)
+	if (trash.data < 12)
 		goto missing;
 
-	line = trash.str;
+	line = trash.area;
 
 	/* Decode a possible NetScaler Client IP request, fail early if
 	 * it does not match */
-	if (ntohl(*(uint32_t *)line) != objt_listener(conn->target)->bind_conf->ns_cip_magic)
+	if (ntohl(*(uint32_t *)line) != __objt_listener(conn->target)->bind_conf->ns_cip_magic)
 		goto bad_magic;
 
 	/* Legacy CIP protocol */
-	if ((trash.str[8] & 0xD0) == 0x40) {
+	if ((trash.area[8] & 0xD0) == 0x40) {
 		hdr_len = ntohl(*(uint32_t *)(line+4));
 		line += 8;
 	}
 	/* Standard CIP protocol */
-	else if (trash.str[8] == 0x00) {
+	else if (trash.area[8] == 0x00) {
 		hdr_len = ntohs(*(uint32_t *)(line+10));
 		line += 12;
 	}
@@ -761,19 +772,19 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 
 	/* Fail if buffer length is not large enough to contain
 	 * a minimal IP header */
-	if (trash.len < 20)
+	if (trash.data < 20)
 		goto missing;
 
 	/* Get IP version from the first four bits */
-	ip_v = (*line & 0xf0) >> 4;
+	ip_ver = (*line & 0xf0) >> 4;
 
-	if (ip_v == 4) {
+	if (ip_ver == 4) {
 		struct ip *hdr_ip4;
 		struct my_tcphdr *hdr_tcp;
 
 		hdr_ip4 = (struct ip *)line;
 
-		if (trash.len < 40 || trash.len < hdr_len) {
+		if (trash.data < 40 || trash.data < hdr_len) {
 			/* Fail if buffer length is not large enough to contain
 			 * IPv4 header, TCP header */
 			goto missing;
@@ -797,13 +808,13 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 
 		conn->flags |= CO_FL_ADDR_FROM_SET | CO_FL_ADDR_TO_SET;
 	}
-	else if (ip_v == 6) {
+	else if (ip_ver == 6) {
 		struct ip6_hdr *hdr_ip6;
 		struct my_tcphdr *hdr_tcp;
 
 		hdr_ip6 = (struct ip6_hdr *)line;
 
-		if (trash.len < 60 || trash.len < hdr_len) {
+		if (trash.data < 60 || trash.data < hdr_len) {
 			/* Fail if buffer length is not large enough to contain
 			 * IPv6 header, TCP header */
 			goto missing;
@@ -834,22 +845,25 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 	}
 
 	line += hdr_len;
-	trash.len = line - trash.str;
+	trash.data = line - trash.area;
 
 	/* remove the NetScaler Client IP header from the request. For this
 	 * we re-read the exact line at once. If we don't get the exact same
 	 * result, we fail.
 	 */
 	do {
-		int len2 = recv(conn->handle.fd, trash.str, trash.len, 0);
+		int len2 = recv(conn->handle.fd, trash.area, trash.data, 0);
 		if (len2 < 0 && errno == EINTR)
 			continue;
-		if (len2 != trash.len)
+		if (len2 != trash.data)
 			goto recv_abort;
 	} while (0);
 
 	conn->flags &= ~flag;
 	return 1;
+
+ not_ready:
+	return 0;
 
  missing:
 	/* Missing data. Since we're using MSG_PEEK, we can only poll again if
@@ -869,7 +883,206 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 	goto fail;
 
  fail:
-	__conn_sock_stop_both(conn);
+	conn->flags |= CO_FL_ERROR;
+	return 0;
+}
+
+
+int conn_send_socks4_proxy_request(struct connection *conn)
+{
+	struct socks4_request req_line;
+
+	/* we might have been called just after an asynchronous shutw */
+	if (conn->flags & CO_FL_SOCK_WR_SH)
+		goto out_error;
+
+	if (!conn_ctrl_ready(conn))
+		goto out_error;
+
+	req_line.version = 0x04;
+	req_line.command = 0x01;
+	req_line.port    = get_net_port(&(conn->addr.to));
+	req_line.ip      = is_inet_addr(&(conn->addr.to));
+	memcpy(req_line.user_id, "HAProxy\0", 8);
+
+	if (conn->send_proxy_ofs > 0) {
+		/*
+		 * This is the first call to send the request
+		 */
+		conn->send_proxy_ofs = -(int)sizeof(req_line);
+	}
+
+	if (conn->send_proxy_ofs < 0) {
+		int ret = 0;
+
+		/* we are sending the socks4_req_line here. If the data layer
+		 * has a pending write, we'll also set MSG_MORE.
+		 */
+		ret = conn_sock_send(
+				conn,
+				((char *)(&req_line)) + (sizeof(req_line)+conn->send_proxy_ofs),
+				-conn->send_proxy_ofs,
+				(conn->flags & CO_FL_XPRT_WR_ENA) ? MSG_MORE : 0);
+
+		DPRINTF(stderr, "SOCKS PROXY HS FD[%04X]: Before send remain is [%d], sent [%d]\n",
+				conn->handle.fd, -conn->send_proxy_ofs, ret);
+
+		if (ret < 0) {
+			goto out_error;
+		}
+
+		conn->send_proxy_ofs += ret; /* becomes zero once complete */
+		if (conn->send_proxy_ofs != 0) {
+			goto out_wait;
+		}
+	}
+
+	/* OK we've the whole request sent */
+	conn->flags &= ~CO_FL_SOCKS4_SEND;
+
+	/* The connection is ready now, simply return and let the connection
+	 * handler notify upper layers if needed.
+	 */
+	if (conn->flags & CO_FL_WAIT_L4_CONN)
+		conn->flags &= ~CO_FL_WAIT_L4_CONN;
+
+	if (conn->flags & CO_FL_SEND_PROXY) {
+		/*
+		 * Get the send_proxy_ofs ready for the send_proxy due to we are
+		 * reusing the "send_proxy_ofs", and SOCKS4 handshake should be done
+		 * before sending PROXY Protocol.
+		 */
+		conn->send_proxy_ofs = 1;
+	}
+	return 1;
+
+ out_error:
+	/* Write error on the file descriptor */
+	conn->flags |= CO_FL_ERROR;
+	if (conn->err_code == CO_ER_NONE) {
+		conn->err_code = CO_ER_SOCKS4_SEND;
+	}
+	return 0;
+
+ out_wait:
+	return 0;
+}
+
+int conn_recv_socks4_proxy_response(struct connection *conn)
+{
+	char line[SOCKS4_HS_RSP_LEN];
+	int ret;
+
+	/* we might have been called just after an asynchronous shutr */
+	if (conn->flags & CO_FL_SOCK_RD_SH)
+		goto fail;
+
+	if (!conn_ctrl_ready(conn))
+		goto fail;
+
+	if (!fd_recv_ready(conn->handle.fd))
+		goto not_ready;
+
+	do {
+		/* SOCKS4 Proxy will response with 8 bytes, 0x00 | 0x5A | 0x00 0x00 | 0x00 0x00 0x00 0x00
+		 * Try to peek into it, before all 8 bytes ready.
+		 */
+		ret = recv(conn->handle.fd, line, SOCKS4_HS_RSP_LEN, MSG_PEEK);
+
+		if (ret == 0) {
+			/* the socket has been closed or shutdown for send */
+			DPRINTF(stderr, "SOCKS PROXY HS FD[%04X]: Received ret[%d], errno[%d], looks like the socket has been closed or shutdown for send\n",
+					conn->handle.fd, ret, errno);
+			if (conn->err_code == CO_ER_NONE) {
+				conn->err_code = CO_ER_SOCKS4_RECV;
+			}
+			goto fail;
+		}
+
+		if (ret > 0) {
+			if (ret == SOCKS4_HS_RSP_LEN) {
+				DPRINTF(stderr, "SOCKS PROXY HS FD[%04X]: Received 8 bytes, the response is [%02X|%02X|%02X %02X|%02X %02X %02X %02X]\n",
+						conn->handle.fd, line[0], line[1], line[2], line[3], line[4], line[5], line[6], line[7]);
+			}else{
+				DPRINTF(stderr, "SOCKS PROXY HS FD[%04X]: Received ret[%d], first byte is [%02X], last bye is [%02X]\n", conn->handle.fd, ret, line[0], line[ret-1]);
+			}
+		} else {
+			DPRINTF(stderr, "SOCKS PROXY HS FD[%04X]: Received ret[%d], errno[%d]\n", conn->handle.fd, ret, errno);
+		}
+
+		if (ret < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			if (errno == EAGAIN) {
+				fd_cant_recv(conn->handle.fd);
+				goto not_ready;
+			}
+			goto recv_abort;
+		}
+	} while (0);
+
+	if (ret < SOCKS4_HS_RSP_LEN) {
+		/* Missing data. Since we're using MSG_PEEK, we can only poll again if
+		 * we are not able to read enough data.
+		 */
+		goto not_ready;
+	}
+
+	/*
+	 * Base on the SOCSK4 protocol:
+	 *
+	 *			+----+----+----+----+----+----+----+----+
+	 *			| VN | CD | DSTPORT |      DSTIP        |
+	 *			+----+----+----+----+----+----+----+----+
+	 *	# of bytes:	   1    1      2              4
+	 *	VN is the version of the reply code and should be 0. CD is the result
+	 *	code with one of the following values:
+	 *	90: request granted
+	 *	91: request rejected or failed
+	 *	92: request rejected becasue SOCKS server cannot connect to identd on the client
+	 *	93: request rejected because the client program and identd report different user-ids
+	 *	The remaining fields are ignored.
+	 */
+	if (line[1] != 90) {
+		conn->flags &= ~CO_FL_SOCKS4_RECV;
+
+		DPRINTF(stderr, "SOCKS PROXY HS FD[%04X]: FAIL, the response is [%02X|%02X|%02X %02X|%02X %02X %02X %02X]\n",
+				conn->handle.fd, line[0], line[1], line[2], line[3], line[4], line[5], line[6], line[7]);
+		if (conn->err_code == CO_ER_NONE) {
+			conn->err_code = CO_ER_SOCKS4_DENY;
+		}
+		goto fail;
+	}
+
+	/* remove the 8 bytes response from the stream */
+	do {
+		ret = recv(conn->handle.fd, line, SOCKS4_HS_RSP_LEN, 0);
+		if (ret < 0 && errno == EINTR) {
+			continue;
+		}
+		if (ret != SOCKS4_HS_RSP_LEN) {
+			if (conn->err_code == CO_ER_NONE) {
+				conn->err_code = CO_ER_SOCKS4_RECV;
+			}
+			goto fail;
+		}
+	} while (0);
+
+	conn->flags &= ~CO_FL_SOCKS4_RECV;
+	return 1;
+
+ not_ready:
+	return 0;
+
+ recv_abort:
+	if (conn->err_code == CO_ER_NONE) {
+		conn->err_code = CO_ER_SOCKS4_ABORT;
+	}
+	conn->flags |= (CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH);
+	goto fail;
+
+ fail:
 	conn->flags |= CO_FL_ERROR;
 	return 0;
 }
@@ -990,6 +1203,7 @@ static int make_tlv(char *dest, int dest_len, char type, uint16_t length, const 
 int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connection *remote)
 {
 	const char pp2_signature[] = PP2_SIGNATURE;
+	void *tlv_crc32c_p = NULL;
 	int ret = 0;
 	struct proxy_hdr_v2 *hdr = (struct proxy_hdr_v2 *)buf;
 	struct sockaddr_storage null_addr = { .ss_family = 0 };
@@ -1062,6 +1276,14 @@ int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connec
 		}
 	}
 
+	if (srv->pp_opts & SRV_PP_V2_CRC32C) {
+		uint32_t zero_crc32c = 0;
+		if ((buf_len - ret) < sizeof(struct tlv))
+			return 0;
+		tlv_crc32c_p = (void *)((struct tlv *)&buf[ret])->value;
+		ret += make_tlv(&buf[ret], (buf_len - ret), PP2_TYPE_CRC32C, sizeof(zero_crc32c), (const char *)&zero_crc32c);
+	}
+
 	if (remote && conn_get_alpn(remote, &value, &value_len)) {
 		if ((buf_len - ret) < sizeof(struct tlv))
 			return 0;
@@ -1069,6 +1291,15 @@ int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connec
 	}
 
 #ifdef USE_OPENSSL
+	if (srv->pp_opts & SRV_PP_V2_AUTHORITY) {
+		value = ssl_sock_get_sni(remote);
+		if (value) {
+			if ((buf_len - ret) < sizeof(struct tlv))
+				return 0;
+			ret += make_tlv(&buf[ret], (buf_len - ret), PP2_TYPE_AUTHORITY, strlen(value), value);
+		}
+	}
+
 	if (srv->pp_opts & SRV_PP_V2_SSL) {
 		struct tlv_ssl *tlv;
 		int ssl_tlv_len = 0;
@@ -1091,9 +1322,31 @@ int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connec
 					tlv->client |= PP2_CLIENT_CERT_CONN;
 			}
 			if (srv->pp_opts & SRV_PP_V2_SSL_CN) {
-				struct chunk *cn_trash = get_trash_chunk();
+				struct buffer *cn_trash = get_trash_chunk();
 				if (ssl_sock_get_remote_common_name(remote, cn_trash) > 0) {
-					ssl_tlv_len += make_tlv(&buf[ret+ssl_tlv_len], (buf_len - ret - ssl_tlv_len), PP2_SUBTYPE_SSL_CN, cn_trash->len, cn_trash->str);
+					ssl_tlv_len += make_tlv(&buf[ret+ssl_tlv_len], (buf_len - ret - ssl_tlv_len), PP2_SUBTYPE_SSL_CN,
+								cn_trash->data,
+								cn_trash->area);
+				}
+			}
+			if (srv->pp_opts & SRV_PP_V2_SSL_KEY_ALG) {
+				struct buffer *pkey_trash = get_trash_chunk();
+				if (ssl_sock_get_pkey_algo(remote, pkey_trash) > 0) {
+					ssl_tlv_len += make_tlv(&buf[ret+ssl_tlv_len], (buf_len - ret - ssl_tlv_len), PP2_SUBTYPE_SSL_KEY_ALG,
+								pkey_trash->data,
+								pkey_trash->area);
+				}
+			}
+			if (srv->pp_opts & SRV_PP_V2_SSL_SIG_ALG) {
+				value = ssl_sock_get_cert_sig(remote);
+				if (value) {
+					ssl_tlv_len += make_tlv(&buf[ret+ssl_tlv_len], (buf_len - ret - ssl_tlv_len), PP2_SUBTYPE_SSL_SIG_ALG, strlen(value), value);
+				}
+			}
+			if (srv->pp_opts & SRV_PP_V2_SSL_CIPHER) {
+				value = ssl_sock_get_cipher_name(remote);
+				if (value) {
+					ssl_tlv_len += make_tlv(&buf[ret+ssl_tlv_len], (buf_len - ret - ssl_tlv_len), PP2_SUBTYPE_SSL_CIPHER, strlen(value), value);
 				}
 			}
 		}
@@ -1103,7 +1356,7 @@ int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connec
 	}
 #endif
 
-#ifdef CONFIG_HAP_NS
+#ifdef USE_NS
 	if (remote && (remote->proxy_netns)) {
 		if ((buf_len - ret) < sizeof(struct tlv))
 			return 0;
@@ -1112,6 +1365,10 @@ int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connec
 #endif
 
 	hdr->len = htons((uint16_t)(ret - PP2_HEADER_LEN));
+
+	if (tlv_crc32c_p) {
+		write_u32(tlv_crc32c_p, htonl(hash_crc32c(buf, ret)));
+	}
 
 	return ret;
 }
@@ -1122,7 +1379,8 @@ int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connec
 static int
 smp_fetch_fc_http_major(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	struct connection *conn = objt_conn(smp->sess->origin);
+	struct connection *conn = (kw[0] != 'b') ? objt_conn(smp->sess->origin) :
+										smp->strm ? cs_conn(objt_cs(smp->strm->si[1].end)) : NULL;
 
 	smp->data.type = SMP_T_SINT;
 	smp->data.u.sint = (conn && strcmp(conn_get_mux_name(conn), "H2") == 0) ? 2 : 1;
@@ -1157,13 +1415,9 @@ int smp_fetch_fc_rcvd_proxy(const struct arg *args, struct sample *smp, const ch
  */
 static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "fc_http_major", smp_fetch_fc_http_major, 0, NULL, SMP_T_SINT, SMP_USE_L4CLI },
+	{ "bc_http_major", smp_fetch_fc_http_major, 0, NULL, SMP_T_SINT, SMP_USE_L4SRV },
 	{ "fc_rcvd_proxy", smp_fetch_fc_rcvd_proxy, 0, NULL, SMP_T_BOOL, SMP_USE_L4CLI },
 	{ /* END */ },
 }};
 
-
-__attribute__((constructor))
-static void __connection_init(void)
-{
-	sample_register_fetches(&sample_fetch_keywords);
-}
+INITCALL1(STG_REGISTER, sample_register_fetches, &sample_fetch_keywords);

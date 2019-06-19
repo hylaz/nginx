@@ -1,7 +1,7 @@
                              ------------------------
                              HAProxy Management Guide
                              ------------------------
-                                   version 1.8
+                                   version 2.0
 
 
 This document describes how to start, stop, manage, and troubleshoot HAProxy,
@@ -30,6 +30,7 @@ Summary
 9.1.      CSV format
 9.2.      Typed output format
 9.3.      Unix Socket commands
+9.4.      Master CLI
 10.   Tricks for easier configuration management
 11.   Well-known traps to avoid
 12.   Debugging and performance issues
@@ -47,13 +48,21 @@ familiar with troubleshooting utilities such as strace and tcpdump.
 2. Quick reminder about HAProxy's architecture
 ----------------------------------------------
 
-HAProxy is a single-threaded, event-driven, non-blocking daemon. This means is
+HAProxy is a multi-threaded, event-driven, non-blocking daemon. This means is
 uses event multiplexing to schedule all of its activities instead of relying on
 the system to schedule between multiple activities. Most of the time it runs as
 a single process, so the output of "ps aux" on a system will report only one
 "haproxy" process, unless a soft reload is in progress and an older process is
 finishing its job in parallel to the new one. It is thus always easy to trace
-its activity using the strace utility.
+its activity using the strace utility. In order to scale with the number of
+available processors, by default haproxy will start one worker thread per
+processor it is allowed to run on. Unless explicitly configured differently,
+the incoming traffic is spread over all these threads, all running the same
+event loop. A great care is taken to limit inter-thread dependencies to the
+strict minimum, so as to try to achieve near-linear scalability. This has some
+impacts such as the fact that a given connection is served by a single thread.
+Thus in order to use all available processing capacity, it is needed to have at
+least as many connections as there are threads, which is almost always granted.
 
 HAProxy is designed to isolate itself into a chroot jail during startup, where
 it cannot perform any file-system access at all. This is also true for the
@@ -161,7 +170,9 @@ list of options is :
     that a faulty configuration doesn't prevent the system from booting.
 
   -L <name> : change the local peer name to <name>, which defaults to the local
-    hostname. This is used only with peers replication.
+    hostname. This is used only with peers replication. You can use the
+    variable $HAPROXY_LOCALPEER in the configuration file to reference the
+    peer name.
 
   -N <limit> : sets the default per-proxy maxconn to <limit> instead of the
     builtin default value (usually 2000). Only useful for debugging.
@@ -266,6 +277,15 @@ list of options is :
   -q : set "quiet" mode. This disables some messages during the configuration
     parsing and during startup. It can be used in combination with "-c" to
     just check if a configuration file is valid or not.
+
+  -S <bind>[,bind_options...]: in master-worker mode, bind a master CLI, which
+    allows the access to every processes, running or leaving ones.
+    For security reasons, it is recommended to bind the master CLI to a local
+    UNIX socket. The bind options are the same as the keyword "bind" in
+    the configuration file with words separated by commas instead of spaces.
+
+    Note that this socket can't be used to retrieve the listening sockets from
+    an old process during a seamless reload.
 
   -sf <pid>* : send the "finish" signal (SIGUSR1) to older processes after boot
     completion to ask them to finish what they are doing and to leave. <pid>
@@ -623,18 +643,26 @@ the "show pools" command :
 
   > show pools
   Dumping pools usage. Use SIGQUIT to flush them.
-    - Pool pipe (32 bytes) : 5 allocated (160 bytes), 5 used, 3 users [SHARED]
-    - Pool hlua_com (48 bytes) : 0 allocated (0 bytes), 0 used, 1 users [SHARED]
-    - Pool vars (64 bytes) : 0 allocated (0 bytes), 0 used, 2 users [SHARED]
-    - Pool task (112 bytes) : 5 allocated (560 bytes), 5 used, 1 users [SHARED]
-    - Pool session (128 bytes) : 1 allocated (128 bytes), 1 used, 2 users [SHARED]
-    - Pool http_txn (272 bytes) : 0 allocated (0 bytes), 0 used, 1 users [SHARED]
-    - Pool connection (352 bytes) : 2 allocated (704 bytes), 2 used, 1 users [SHARED]
-    - Pool hdr_idx (416 bytes) : 0 allocated (0 bytes), 0 used, 1 users [SHARED]
-    - Pool stream (864 bytes) : 1 allocated (864 bytes), 1 used, 1 users [SHARED]
-    - Pool requri (1024 bytes) : 0 allocated (0 bytes), 0 used, 1 users [SHARED]
-    - Pool buffer (8064 bytes) : 3 allocated (24192 bytes), 2 used, 1 users [SHARED]
-  Total: 11 pools, 26608 bytes allocated, 18544 used.
+    - Pool cache_st (16 bytes) : 0 allocated (0 bytes), 0 used, 0 failures, 1 users, @0x9ccc40=03 [SHARED]
+    - Pool pipe (32 bytes) : 5 allocated (160 bytes), 5 used, 0 failures, 2 users, @0x9ccac0=00 [SHARED]
+    - Pool comp_state (48 bytes) : 3 allocated (144 bytes), 3 used, 0 failures, 5 users, @0x9cccc0=04 [SHARED]
+    - Pool filter (64 bytes) : 0 allocated (0 bytes), 0 used, 0 failures, 3 users, @0x9ccbc0=02 [SHARED]
+    - Pool vars (80 bytes) : 0 allocated (0 bytes), 0 used, 0 failures, 2 users, @0x9ccb40=01 [SHARED]
+    - Pool uniqueid (128 bytes) : 0 allocated (0 bytes), 0 used, 0 failures, 2 users, @0x9cd240=15 [SHARED]
+    - Pool task (144 bytes) : 55 allocated (7920 bytes), 55 used, 0 failures, 1 users, @0x9cd040=11 [SHARED]
+    - Pool session (160 bytes) : 1 allocated (160 bytes), 1 used, 0 failures, 1 users, @0x9cd140=13 [SHARED]
+    - Pool h2s (208 bytes) : 0 allocated (0 bytes), 0 used, 0 failures, 2 users, @0x9ccec0=08 [SHARED]
+    - Pool h2c (288 bytes) : 0 allocated (0 bytes), 0 used, 0 failures, 1 users, @0x9cce40=07 [SHARED]
+    - Pool spoe_ctx (304 bytes) : 0 allocated (0 bytes), 0 used, 0 failures, 2 users, @0x9ccf40=09 [SHARED]
+    - Pool connection (400 bytes) : 2 allocated (800 bytes), 2 used, 0 failures, 1 users, @0x9cd1c0=14 [SHARED]
+    - Pool hdr_idx (416 bytes) : 0 allocated (0 bytes), 0 used, 0 failures, 1 users, @0x9cd340=17 [SHARED]
+    - Pool dns_resolut (480 bytes) : 0 allocated (0 bytes), 0 used, 0 failures, 1 users, @0x9ccdc0=06 [SHARED]
+    - Pool dns_answer_ (576 bytes) : 0 allocated (0 bytes), 0 used, 0 failures, 1 users, @0x9ccd40=05 [SHARED]
+    - Pool stream (960 bytes) : 1 allocated (960 bytes), 1 used, 0 failures, 1 users, @0x9cd0c0=12 [SHARED]
+    - Pool requri (1024 bytes) : 0 allocated (0 bytes), 0 used, 0 failures, 1 users, @0x9cd2c0=16 [SHARED]
+    - Pool buffer (8030 bytes) : 3 allocated (24090 bytes), 2 used, 0 failures, 1 users, @0x9cd3c0=18 [SHARED]
+    - Pool trash (8062 bytes) : 1 allocated (8062 bytes), 1 used, 0 failures, 1 users, @0x9cd440=19
+  Total: 19 pools, 42296 bytes allocated, 34266 used.
 
 The pool name is only indicative, it's the name of the first object type using
 this pool. The size in parenthesis is the object size for objects in this pool.
@@ -643,7 +671,9 @@ number of objects currently allocated and the equivalent number of bytes is
 reported so that it is easy to know which pool is responsible for the highest
 memory usage. The number of objects currently in use is reported as well in the
 "used" field. The difference between "allocated" and "used" corresponds to the
-objects that have been freed and are available for immediate use.
+objects that have been freed and are available for immediate use. The address
+at the end of the line is the pool's address, and the following number is the
+pool index when it exists, or is reported as -1 if no index was assigned.
 
 It is possible to limit the amount of memory allocated per process using the
 "-m" command line option, followed by a number of megabytes. It covers all of
@@ -1068,6 +1098,7 @@ S (Servers).
  80: intercepted [.FB.]: cum. number of intercepted requests (monitor, stats)
  81: dcon [LF..]: requests denied by "tcp-request connection" rules
  82: dses [LF..]: requests denied by "tcp-request session" rules
+ 83: wrew [LFBS]: cumulative number of failed header rewriting warnings
 
 
 9.2) Typed output format
@@ -1296,6 +1327,18 @@ delimiter to mark an end of output for each command, and takes care of ensuring
 that no command can emit an empty line on output. A script can thus easily
 parse the output even when multiple commands were pipelined on a single line.
 
+Some commands may take an optional payload. To add one to a command, the first
+line needs to end with the "<<\n" pattern. The next lines will be treated as
+the payload and can contain as many lines as needed. To validate a command with
+a payload, it needs to end with an empty line.
+
+Limitations do exist: the length of the whole buffer passed to the CLI must
+not be greater than tune.bfsize and the pattern "<<" must not be glued to the
+last word of the line.
+
+When entering a paylod while in interactive mode, the prompt will change from
+"> " to "+ ".
+
 It is important to understand that when multiple haproxy processes are started
 on the same sockets, any process may pick up the request and will output its
 own stats.
@@ -1317,11 +1360,28 @@ add acl <acl> <pattern>
   In this case, you must use the command "add map" in place of "add acl".
 
 add map <map> <key> <value>
+add map <map> <payload>
   Add an entry into the map <map> to associate the value <value> to the key
   <key>. This command does not verify if the entry already exists. It is
   mainly used to fill a map after a clear operation. Note that if the reference
   <map> is a file and is shared with a map, this map will contain also a new
-  pattern entry.
+  pattern entry. Using the payload syntax it is possible to add multiple
+  key/value pairs by entering them on separate lines. On each new line, the
+  first word is the key and the rest of the line is considered to be the value
+  which can even contains spaces.
+
+  Example:
+
+    # socat /tmp/sock1 -
+    prompt
+
+    > add map #-1 <<
+    + key1 value1
+    + key2 value2 with spaces
+    + key3 value3 also with spaces
+    + key4 value4
+
+    >
 
 clear counters
   Clear the max values of the statistics counters in each proxy (frontend &
@@ -1393,6 +1453,12 @@ clear table <table> [ data.<type> <operator> <value> ] | [ key <key> ]
         $ echo "clear table http_proxy data.gpc0 eq 1" | socat stdio /tmp/sock1
         $ echo "show table http_proxy" | socat stdio /tmp/sock1
     >>> # table: http_proxy, type: ip, size:204800, used:1
+
+debug dev <command> [args]*
+  Call a developer-specific command. Only supported when haproxy is built with
+  DEBUG_DEV defined. Supported commands are then listed in the help message.
+  All of these commands require admin privileges, and must never appear on a
+  production system as most of them are unsafe and dangerous.
 
 del acl <acl> [<key>|#<ref>]
   Delete all the acl entries from the acl <acl> corresponding to the key <key>.
@@ -1607,6 +1673,11 @@ set maxconn global <maxconn>
   delayed until the threshold is reached. A value of zero restores the initial
   setting.
 
+set profiling { tasks } { auto | on | off }
+  Enables or disables CPU profiling for the indicated subsystem. This is
+  equivalent to setting or clearing the "profiling" settings in the "global"
+  section of the configuration file. Please also see "show profiling".
+
 set rate-limit connections global <value>
   Change the process-wide connection rate limit, which is set by the global
   'maxconnrate' setting. A value of zero disables the limitation. This limit
@@ -1634,7 +1705,7 @@ set rate-limit ssl-sessions global <value>
 
 set server <backend>/<server> addr <ip4 or ip6 address> [port <port>]
   Replace the current IP address of a server by the one provided.
-  Optionnaly, the port can be changed using the 'port' parameter.
+  Optionally, the port can be changed using the 'port' parameter.
   Note that changing the port also support switching from/to port mapping
   (notation with +X or -Y), only if a port is configured for the health check.
 
@@ -1682,7 +1753,7 @@ set severity-output [ none | number | string ]
   Change the severity output format of the stats socket connected to for the
   duration of the current session.
 
-set ssl ocsp-response <response>
+set ssl ocsp-response <response | payload>
   This command is used to update an OCSP Response for a certificate (see "crt"
   on "bind" lines). Same controls are performed as during the initial loading of
   the response. The <response> must be passed as a base64 encoded string of the
@@ -1695,12 +1766,16 @@ set ssl ocsp-response <response>
     echo "set ssl ocsp-response $(base64 -w 10000 resp.der)" | \
                  socat stdio /var/run/haproxy.stat
 
+    using the payload syntax:
+    echo -e "set ssl ocsp-response <<\n$(base64 resp.der)\n" | \
+                 socat stdio /var/run/haproxy.stat
+
 set ssl tls-key <id> <tlskey>
   Set the next TLS key for the <id> listener to <tlskey>. This key becomes the
   ultimate key, while the penultimate one is used for encryption (others just
   decrypt). The oldest TLS key present is overwritten. <id> is either a numeric
   #<id> or <file> returned by "show tls-keys". <tlskey> is a base64 encoded 48
-  bit TLS ticket key (ex. openssl rand -base64 48).
+  or 80 bits TLS ticket key (ex. openssl rand 80 | openssl base64 -A).
 
 set table <table> key <key> [data.<data_type> <value>]*
   Create or update a stick-table entry in the table. If the key is not present,
@@ -1742,6 +1817,43 @@ show acl [<acl>]
 
 show backend
   Dump the list of backends available in the running process
+
+show cli level
+  Display the CLI level of the current CLI session. The result could be
+  'admin', 'operator' or 'user'. See also the 'operator' and 'user' commands.
+
+  Example :
+
+    $ socat /tmp/sock1 readline
+    prompt
+    > operator
+    > show cli level
+    operator
+    > user
+    > show cli level
+    user
+    > operator
+    Permission denied
+
+operator
+  Decrease the CLI level of the current CLI session to operator. It can't be
+  increase. See also "show cli level"
+
+user
+  Decrease the CLI level of the current CLI session to user. It can't be
+  increase. See also "show cli level"
+
+show activity
+  Reports some counters about internal events that will help developers and
+  more generally people who know haproxy well enough to narrow down the causes
+  of reports of abnormal behaviours. A typical example would be a properly
+  running process never sleeping and eating 100% of the CPU. The output fields
+  will be made of one line per metric, and per-thread counters on the same
+  line. These counters are 32-bit and will wrap during the process' life, which
+  is not a problem since calls to this command will typically be performed
+  twice. The fields are purposely not documented so that their exact meaning is
+  verified in the code where the counters are fed. These values are also reset
+  by the "clear counters" command.
 
 show cli sockets
   List CLI sockets. The output format is composed of 3 fields separated by
@@ -1867,18 +1979,6 @@ show fd [<fd>]
   that the output format may evolve over time so this output must not be parsed
   by tools designed to be durable.
 
-show activity
-  Reports some counters about internal events that will help developers and
-  more generally people who know haproxy well enough to narrow down the causes
-  of reports of abnormal behaviours. A typical example would be a properly
-  running process never sleeping and eating 100% of the CPU. The output fields
-  will be made of one line per metric, and per-thread counters on the same
-  line. These counters are 32-bit and will wrap during the process' life, which
-  is not a problem since calls to this command will typically be performed
-  twice. The fields are purposely not documented so that their exact meaning is
-  verified in the code where the counters are fed. These values are also reset
-  by the "clear counters" command.
-
 show info [typed|json]
   Dump info about haproxy status on current process. If "typed" is passed as an
   optional argument, field numbers, names and types are emitted as well so that
@@ -1993,11 +2093,68 @@ show map [<map>]
   are not directly a list of available maps, but are the list of all patterns
   composing any map. Many of these patterns can be shared with ACL.
 
+show peers [<peers section>]
+  Dump info about the peers configured in "peers" sections. Without argument,
+  the list of the peers belonging to all the "peers" sections are listed. If
+  <peers section> is specified, only the information about the peers belonging
+  to this "peers" section are dumped.
+
+  Here are two examples of outputs where hostA, hostB and hostC peers belong to
+  "sharedlb" peers sections. Only hostA and hostB are connected. Only hostA has
+  sent data to hostB.
+
+  $ echo "show peers" | socat - /tmp/hostA
+  0x55deb0224320: [15/Apr/2019:11:28:01] id=sharedlb state=0 flags=0x3 \
+    resync_timeout=<PAST> task_calls=45122
+      0x55deb022b540: id=hostC(remote) addr=127.0.0.12:10002 status=CONN \
+        reconnect=4s confirm=0
+        flags=0x0
+      0x55deb022a440: id=hostA(local) addr=127.0.0.10:10000 status=NONE \
+        reconnect=<NEVER> confirm=0
+        flags=0x0
+      0x55deb0227d70: id=hostB(remote) addr=127.0.0.11:10001 status=ESTA
+        reconnect=2s confirm=0
+        flags=0x20000200 appctx:0x55deb028fba0 st0=7 st1=0 task_calls=14456 \
+          state=EST
+        xprt=RAW src=127.0.0.1:37257 addr=127.0.0.10:10000
+        remote_table:0x55deb0224a10 id=stkt local_id=1 remote_id=1
+        last_local_table:0x55deb0224a10 id=stkt local_id=1 remote_id=1
+        shared tables:
+          0x55deb0224a10 local_id=1 remote_id=1 flags=0x0 remote_data=0x65
+            last_acked=0 last_pushed=3 last_get=0 teaching_origin=0 update=3
+            table:0x55deb022d6a0 id=stkt update=3 localupdate=3 \
+              commitupdate=3 syncing=0
+
+  $ echo "show peers" | socat - /tmp/hostB
+  0x55871b5ab320: [15/Apr/2019:11:28:03] id=sharedlb state=0 flags=0x3 \
+    resync_timeout=<PAST> task_calls=3
+      0x55871b5b2540: id=hostC(remote) addr=127.0.0.12:10002 status=CONN \
+        reconnect=3s confirm=0
+        flags=0x0
+      0x55871b5b1440: id=hostB(local) addr=127.0.0.11:10001 status=NONE \
+        reconnect=<NEVER> confirm=0
+        flags=0x0
+      0x55871b5aed70: id=hostA(remote) addr=127.0.0.10:10000 status=ESTA \
+        reconnect=2s confirm=0
+        flags=0x20000200 appctx:0x7fa46800ee00 st0=7 st1=0 task_calls=62356 \
+          state=EST
+        remote_table:0x55871b5ab960 id=stkt local_id=1 remote_id=1
+        last_local_table:0x55871b5ab960 id=stkt local_id=1 remote_id=1
+        shared tables:
+          0x55871b5ab960 local_id=1 remote_id=1 flags=0x0 remote_data=0x65
+            last_acked=3 last_pushed=0 last_get=3 teaching_origin=0 update=0
+            table:0x55871b5b46a0 id=stkt update=1 localupdate=0 \
+              commitupdate=0 syncing=0
+
 show pools
   Dump the status of internal memory pools. This is useful to track memory
   usage when suspecting a memory leak for example. It does exactly the same
   as the SIGQUIT when running in foreground except that it does not flush
   the pools.
+
+show profiling
+  Dumps the current profiling settings, one per line, as well as the command
+  needed to change them.
 
 show servers state [<backend>]
   Dump the state of the servers found in the running configuration. A backend
@@ -2361,6 +2518,26 @@ show table <name> [ data.<type> <operator> <value> ] | [ key <key> ]
           | fgrep 'key=' | cut -d' ' -f2 | cut -d= -f2 > abusers-ip.txt
           ( or | awk '/key/{ print a[split($2,a,"=")]; }' )
 
+show threads
+  Dumps some internal states and structures for each thread, that may be useful
+  to help developers understand a problem. The output tries to be readable by
+  showing one block per thread. When haproxy is built with USE_THREAD_DUMP=1,
+  an advanced dump mechanism involving thread signals is used so that each
+  thread can dump its own state in turn. Without this option, the thread
+  processing the command shows all its details but the other ones are less
+  detailed. A star ('*') is displayed in front of the thread handling the
+  command. A right angle bracket ('>') may also be displayed in front of
+  threads which didn't make any progress since last invocation of this command,
+  indicating a bug in the code which must absolutely be reported. When this
+  happens between two threads it usually indicates a deadlock. If a thread is
+  alone, it's a different bug like a corrupted list. In all cases the process
+  needs is not fully functional anymore and needs to be restarted.
+
+  The output format is purposely not documented so that it can easily evolve as
+  new needs are identified, without having to maintain any form of backwards
+  compatibility, and just like with "show activity", the values are meaningless
+  without the code at hand.
+
 show tls-keys [id|*]
   Dump all loaded TLS ticket keys references. The TLS ticket key reference ID
   and the file from which the keys have been loaded is shown. Both of those
@@ -2411,6 +2588,102 @@ shutdown sessions server <backend>/<server>
   can be used to terminate long-running sessions after a server is put into
   maintenance mode, for instance. Such terminated sessions are reported with a
   'K' flag in the logs.
+
+
+9.4. Master CLI
+---------------
+
+The master CLI is a socket bound to the master process in master-worker mode.
+This CLI gives access to the unix socket commands in every running or leaving
+processes and allows a basic supervision of those processes.
+
+The master CLI is configurable only from the haproxy program arguments with
+the -S option. This option also takes bind options separated by commas.
+
+Example:
+
+   # haproxy -W -S 127.0.0.1:1234 -f test1.cfg
+   # haproxy -Ws -S /tmp/master-socket,uid,1000,gid,1000,mode,600 -f test1.cfg
+   # haproxy -W -S /tmp/master-socket,level,user -f test1.cfg
+
+The master CLI introduces a new 'show proc' command to surpervise the
+processes:
+
+Example:
+
+  $ echo 'show proc' | socat /var/run/haproxy-master.sock -
+  #<PID>          <type>          <relative PID>  <reloads>       <uptime>        <version>
+  1162            master          0               5               0d00h02m07s     2.0-dev7-0124c9-7
+  # workers
+  1271            worker          1               0               0d00h00m00s     2.0-dev7-0124c9-7
+  1272            worker          2               0               0d00h00m00s     2.0-dev7-0124c9-7
+  # old workers
+  1233            worker          [was: 1]        3               0d00h00m43s     2.0-dev3-6019f6-289
+
+
+In this example, the master has been reloaded 5 times but one of the old
+worker is still running and survived 3 reloads. You could access the CLI of
+this worker to understand what's going on.
+
+When the prompt is enabled (via the "prompt" command), the context the CLI is
+working on is displayed in the prompt. The master is identified by the "master"
+string, and other processes are identified with their PID. In case the last
+reload failed, the master prompt will be changed to "master[ReloadFailed]>" so
+that it becomes visible that the process is still running on the previous
+configuration and that the new configuration is not operational.
+
+The master CLI uses a special prefix notation to access the multiple
+processes. This notation is easily identifiable as it begins by a @.
+
+A @ prefix can be followed by a relative process number or by an exclamation
+point and a PID. (e.g. @1 or @!1271). A @ alone could be use to specify the
+master. Leaving processes are only accessible with the PID as relative process
+number are only usable with the current processes.
+
+Examples:
+
+  $ socat /var/run/haproxy-master.sock readline
+  prompt
+  master> @1 show info; @2 show info
+  [...]
+  Process_num: 1
+  Pid: 1271
+  [...]
+  Process_num: 2
+  Pid: 1272
+  [...]
+  master>
+
+  $ echo '@!1271 show info; @!1272 show info' | socat /var/run/haproxy-master.sock -
+  [...]
+
+A prefix could be use as a command, which will send every next commands to
+the specified process.
+
+Examples:
+
+  $ socat /var/run/haproxy-master.sock readline
+  prompt
+  master> @1
+  1271> show info
+  [...]
+  1271> show stat
+  [...]
+  1271> @
+  master>
+
+  $ echo '@1; show info; show stat; @2; show info; show stat' | socat /var/run/haproxy-master.sock -
+  [...]
+
+You can also reload the HAProxy master process with the "reload" command which
+does the same as a `kill -USR2` on the master process, provided that the user
+has at least "operator" or "admin" privileges.
+
+Example:
+
+  $ echo "reload" | socat /var/run/haproxy-master.sock
+
+Note that a reload will close the connection to the master CLI.
 
 
 10. Tricks for easier configuration management

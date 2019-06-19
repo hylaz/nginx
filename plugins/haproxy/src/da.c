@@ -2,7 +2,12 @@
 
 #include <common/cfgparse.h>
 #include <common/errors.h>
+#include <common/http.h>
+#include <common/initcall.h>
+#include <types/global.h>
 #include <proto/arg.h>
+#include <proto/http_fetch.h>
+#include <proto/http_htx.h>
 #include <proto/log.h>
 #include <proto/proto_http.h>
 #include <proto/sample.h>
@@ -183,7 +188,7 @@ static void deinit_deviceatlas(void)
 
 static int da_haproxy(const struct arg *args, struct sample *smp, da_deviceinfo_t *devinfo)
 {
-	struct chunk *tmp;
+	struct buffer *tmp;
 	da_propid_t prop, *pprop;
 	da_status_t status;
 	da_type_t proptype;
@@ -193,10 +198,11 @@ static int da_haproxy(const struct arg *args, struct sample *smp, da_deviceinfo_
 	tmp = get_trash_chunk();
 	chunk_reset(tmp);
 
-	propname = (const char *)args[0].data.str.str;
+	propname = (const char *) args[0].data.str.area;
 	i = 0;
 
-	for (; propname != 0; i ++, propname = (const char *)args[i].data.str.str) {
+	for (; propname != 0; i ++,
+	     propname = (const char *) args[i].data.str.area) {
 		status = da_atlas_getpropid(&global_deviceatlas.atlas,
 			propname, &prop);
 		if (status != DA_OK) {
@@ -241,13 +247,13 @@ static int da_haproxy(const struct arg *args, struct sample *smp, da_deviceinfo_
 
 	da_close(devinfo);
 
-	if (tmp->len) {
-		--tmp->len;
-		tmp->str[tmp->len] = 0;
+	if (tmp->data) {
+		--tmp->data;
+		tmp->area[tmp->data] = 0;
 	}
 
-	smp->data.u.str.str = tmp->str;
-	smp->data.u.str.len = tmp->len;
+	smp->data.u.str.area = tmp->area;
+	smp->data.u.str.data = tmp->data;
 
 	return 1;
 }
@@ -260,12 +266,12 @@ static int da_haproxy_conv(const struct arg *args, struct sample *smp, void *pri
 	char useragentbuf[1024] = { 0 };
 	int i;
 
-	if (global_deviceatlas.daset == 0 || smp->data.u.str.len == 0) {
+	if (global_deviceatlas.daset == 0 || smp->data.u.str.data == 0) {
 		return 1;
 	}
 
-	i = smp->data.u.str.len > sizeof(useragentbuf) ? sizeof(useragentbuf) : smp->data.u.str.len;
-	memcpy(useragentbuf, smp->data.u.str.str, i - 1);
+	i = smp->data.u.str.data > sizeof(useragentbuf) ? sizeof(useragentbuf) : smp->data.u.str.data;
+	memcpy(useragentbuf, smp->data.u.str.area, i - 1);
 	useragentbuf[i - 1] = 0;
 
 	useragent = (const char *)useragentbuf;
@@ -280,83 +286,164 @@ static int da_haproxy_conv(const struct arg *args, struct sample *smp, void *pri
 
 static int da_haproxy_fetch(const struct arg *args, struct sample *smp, const char *kw, void *private)
 {
-	struct hdr_idx *hidx;
-	struct hdr_ctx hctx;
-	const struct http_msg *hmsg;
 	da_evidence_t ev[DA_MAX_HEADERS];
 	da_deviceinfo_t devinfo;
 	da_status_t status;
+	struct channel *chn;
 	char vbuf[DA_MAX_HEADERS][1024] = {{ 0 }};
 	int i, nbh = 0;
 
 	if (global_deviceatlas.daset == 0) {
-		return 1;
+		return 0;
 	}
 
-	CHECK_HTTP_MESSAGE_FIRST();
-	smp->data.type = SMP_T_STR;
-
-	/**
-	 * Here we go through the whole list of headers from start
-	 * they will be filtered via the DeviceAtlas API itself
-	 */
-	hctx.idx = 0;
-	hidx = &smp->strm->txn->hdr_idx;
-	hmsg = &smp->strm->txn->req;
-
-	while (http_find_next_header(hmsg->chn->buf->p, hidx, &hctx) == 1 &&
-	        nbh < DA_MAX_HEADERS) {
-		char *pval;
-		size_t vlen;
-		da_evidence_id_t evid = -1;
-		char hbuf[24] = { 0 };
-
-		/* The HTTP headers used by the DeviceAtlas API are not longer */
-		if (hctx.del >= sizeof(hbuf) || hctx.del <= 0 || hctx.vlen <= 0) {
-			continue;
+	chn = (smp->strm ? &smp->strm->req : NULL);
+	/* HTX Mode check */
+	if (smp->px->options2 & PR_O2_USE_HTX) {
+		struct htx_blk *blk;
+		struct htx *htx = smp_prefetch_htx(smp, chn, 1);
+		if (!htx) {
+			return 0;
 		}
 
-		vlen = hctx.vlen;
-		memcpy(hbuf, hctx.line, hctx.del);
-		hbuf[hctx.del] = 0;
-		pval = (hctx.line + hctx.val);
+		i = 0;
+		for (blk = htx_get_first_blk(htx); nbh < DA_MAX_HEADERS && blk; blk = htx_get_next_blk(htx, blk)) {
+			size_t vlen;
+			char *pval;
+			da_evidence_id_t evid;
+			enum htx_blk_type type;
+			struct ist n, v;
+			char hbuf[24] = { 0 };
+			char tval[1024] = { 0 };
 
-		if (strcmp(hbuf, "Accept-Language") == 0) {
-			evid = da_atlas_accept_language_evidence_id(&global_deviceatlas.
-				atlas);
-		} else if (strcmp(hbuf, "Cookie") == 0) {
-			char *p, *eval;
-			int pl;
+			type = htx_get_blk_type(blk);
 
-			eval = pval + hctx.vlen;
-			/**
-			 * The cookie value, if it exists, is located between the current header's
-			 * value position and the next one
-			 */
-			if (extract_cookie_value(pval, eval, global_deviceatlas.cookiename,
-				global_deviceatlas.cookienamelen, 1, &p, &pl) == NULL) {
+			if (type == HTX_BLK_HDR) {
+				n = htx_get_blk_name(htx, blk);
+				v = htx_get_blk_value(htx, blk);
+			} else if (type == HTX_BLK_EOH) {
+				break;
+			} else {
 				continue;
 			}
 
-			vlen = (size_t)pl;
-			pval = p;
-			evid = da_atlas_clientprop_evidence_id(&global_deviceatlas.atlas);
-		} else {
-			evid = da_atlas_header_evidence_id(&global_deviceatlas.atlas,
-				hbuf);
-		}
+			/* The HTTP headers used by the DeviceAtlas API are not longer */
+			if (n.len >= sizeof(hbuf)) {
+				continue;
+			}
 
-		if (evid == -1) {
-			continue;
-		}
+			memcpy(hbuf, n.ptr, n.len);
+			hbuf[n.len] = 0;
+			pval = v.ptr;
+			vlen = v.len;
+			evid = -1;
+			i = v.len > sizeof(tval) - 1 ? sizeof(tval) - 1 : v.len;
+			memcpy(tval, v.ptr, i);
+			tval[i] = 0;
+			pval = tval;
 
-		i = vlen > sizeof(vbuf[nbh]) ? sizeof(vbuf[nbh]) : vlen;
-		memcpy(vbuf[nbh], pval, i - 1);
-		vbuf[nbh][i - 1] = 0;
-		ev[nbh].key = evid;
-		ev[nbh].value = vbuf[nbh];
-		ev[nbh].value[vlen] = 0;
-		++ nbh;
+			if (strcasecmp(hbuf, "Accept-Language") == 0) {
+				evid = da_atlas_accept_language_evidence_id(&global_deviceatlas.atlas);
+			} else if (strcasecmp(hbuf, "Cookie") == 0) {
+				char *p, *eval;
+				size_t pl;
+
+				eval = pval + vlen;
+				/**
+				 * The cookie value, if it exists, is located between the current header's
+				 * value position and the next one
+				 */
+				if (http_extract_cookie_value(pval, eval, global_deviceatlas.cookiename,
+							global_deviceatlas.cookienamelen, 1, &p, &pl) == NULL) {
+					continue;
+				}
+
+				vlen -= global_deviceatlas.cookienamelen - 1;
+				pval = p;
+				evid = da_atlas_clientprop_evidence_id(&global_deviceatlas.atlas);
+			} else {
+				evid = da_atlas_header_evidence_id(&global_deviceatlas.atlas, hbuf);
+			}
+
+			if (evid == -1) {
+				continue;
+			}
+
+			i = vlen > sizeof(vbuf[nbh]) - 1 ? sizeof(vbuf[nbh]) - 1 : vlen;
+			memcpy(vbuf[nbh], pval, i);
+			vbuf[nbh][i] = 0;
+			ev[nbh].key = evid;
+			ev[nbh].value = vbuf[nbh];
+			++ nbh;
+		}
+	} else {
+		struct hdr_idx *hidx;
+		struct hdr_ctx hctx;
+		const struct http_msg *hmsg;
+		CHECK_HTTP_MESSAGE_FIRST(chn);
+		smp->data.type = SMP_T_STR;
+
+		/**
+		 * Here we go through the whole list of headers from start
+		 * they will be filtered via the DeviceAtlas API itself
+		 */
+		hctx.idx = 0;
+		hidx = &smp->strm->txn->hdr_idx;
+		hmsg = &smp->strm->txn->req;
+
+		while (http_find_next_header(ci_head(hmsg->chn), hidx, &hctx) == 1 &&
+				nbh < DA_MAX_HEADERS) {
+			char *pval;
+			size_t vlen;
+			da_evidence_id_t evid = -1;
+			char hbuf[24] = { 0 };
+
+			/* The HTTP headers used by the DeviceAtlas API are not longer */
+			if (hctx.del >= sizeof(hbuf) || hctx.del <= 0 || hctx.vlen <= 0) {
+				continue;
+			}
+
+			vlen = hctx.vlen;
+			memcpy(hbuf, hctx.line, hctx.del);
+			hbuf[hctx.del] = 0;
+			pval = (hctx.line + hctx.val);
+
+			if (strcmp(hbuf, "Accept-Language") == 0) {
+				evid = da_atlas_accept_language_evidence_id(&global_deviceatlas.
+						atlas);
+			} else if (strcmp(hbuf, "Cookie") == 0) {
+				char *p, *eval;
+				size_t pl;
+
+				eval = pval + hctx.vlen;
+				/**
+				 * The cookie value, if it exists, is located between the current header's
+				 * value position and the next one
+				 */
+				if (http_extract_cookie_value(pval, eval, global_deviceatlas.cookiename,
+							global_deviceatlas.cookienamelen, 1, &p, &pl) == NULL) {
+					continue;
+				}
+
+				vlen = (size_t)pl;
+				pval = p;
+				evid = da_atlas_clientprop_evidence_id(&global_deviceatlas.atlas);
+			} else {
+				evid = da_atlas_header_evidence_id(&global_deviceatlas.atlas,
+						hbuf);
+			}
+
+			if (evid == -1) {
+				continue;
+			}
+
+			i = vlen > sizeof(vbuf[nbh]) ? sizeof(vbuf[nbh]) : vlen;
+			memcpy(vbuf[nbh], pval, i - 1);
+			vbuf[nbh][i - 1] = 0;
+			ev[nbh].key = evid;
+			ev[nbh].value = vbuf[nbh];
+			++ nbh;
+		}
 	}
 
 	status = da_searchv(&global_deviceatlas.atlas, &devinfo,
@@ -367,32 +454,42 @@ static int da_haproxy_fetch(const struct arg *args, struct sample *smp, const ch
 
 static struct cfg_kw_list dacfg_kws = {{ }, {
 	{ CFG_GLOBAL, "deviceatlas-json-file",	  da_json_file },
-	{ CFG_GLOBAL, "deviceatlas-log-level",	  da_log_level },
-	{ CFG_GLOBAL, "deviceatlas-property-separator", da_property_separator },
-	{ CFG_GLOBAL, "deviceatlas-properties-cookie", da_properties_cookie },
-	{ 0, NULL, NULL },
+		{ CFG_GLOBAL, "deviceatlas-log-level",	  da_log_level },
+		{ CFG_GLOBAL, "deviceatlas-property-separator", da_property_separator },
+		{ CFG_GLOBAL, "deviceatlas-properties-cookie", da_properties_cookie },
+		{ 0, NULL, NULL },
 }};
+
+INITCALL1(STG_REGISTER, cfg_register_keywords, &dacfg_kws);
 
 /* Note: must not be declared <const> as its list will be overwritten */
 static struct sample_fetch_kw_list fetch_kws = {ILH, {
 	{ "da-csv-fetch", da_haproxy_fetch, ARG12(1,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR), NULL, SMP_T_STR, SMP_USE_HRQHV },
-	{ NULL, NULL, 0, 0, 0 },
+		{ NULL, NULL, 0, 0, 0 },
 }};
+
+INITCALL1(STG_REGISTER, sample_register_fetches, &fetch_kws);
 
 /* Note: must not be declared <const> as its list will be overwritten */
 static struct sample_conv_kw_list conv_kws = {ILH, {
 	{ "da-csv-conv", da_haproxy_conv, ARG12(1,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR,STR), NULL, SMP_T_STR, SMP_T_STR },
-	{ NULL, NULL, 0, 0, 0 },
+		{ NULL, NULL, 0, 0, 0 },
 }};
 
-__attribute__((constructor))
-static void __da_init(void)
+static void da_haproxy_register_build_options()
 {
-	/* register sample fetch and format conversion keywords */
-	sample_register_fetches(&fetch_kws);
-	sample_register_convs(&conv_kws);
-	cfg_register_keywords(&dacfg_kws);
-	hap_register_build_opts("Built with DeviceAtlas support.", 0);
-	hap_register_post_check(init_deviceatlas);
-	hap_register_post_deinit(deinit_deviceatlas);
+	char *ptr = NULL;
+
+#ifdef MOBI_DA_DUMMY_LIBRARY
+	memprintf(&ptr, "Built with DeviceAtlas support (dummy library only).");
+#else
+	memprintf(&ptr, "Built with DeviceAtlas support (library version %u.%u).", MOBI_DA_MAJOR, MOBI_DA_MINOR);
+#endif
+	hap_register_build_opts(ptr, 1);
 }
+
+INITCALL1(STG_REGISTER, sample_register_convs, &conv_kws);
+
+REGISTER_POST_CHECK(init_deviceatlas);
+REGISTER_POST_DEINIT(deinit_deviceatlas);
+INITCALL0(STG_REGISTER, da_haproxy_register_build_options);

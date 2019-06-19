@@ -38,25 +38,13 @@
 #include <common/namespace.h>
 #include <eb32tree.h>
 #include <eb32sctree.h>
-
-#ifndef LLONG_MAX
-# define LLONG_MAX 9223372036854775807LL
-# define LLONG_MIN (-LLONG_MAX - 1LL)
-#endif
-
-#ifndef ULLONG_MAX
-# define ULLONG_MAX	(LLONG_MAX * 2ULL + 1)
-#endif
-
-#ifndef LONGBITS
-#define LONGBITS  ((unsigned int)sizeof(long) * 8)
-#endif
+#include <types/protocol.h>
 
 /* size used for max length of decimal representation of long long int. */
 #define NB_LLMAX_STR (sizeof("-9223372036854775807")-1)
 
 /* number of itoa_str entries */
-#define NB_ITOA_STR	10
+#define NB_ITOA_STR	16
 
 /* maximum quoted string length (truncated above) */
 #define QSTR_SIZE 200
@@ -194,7 +182,7 @@ static inline const char *U2H(unsigned long long n)
 	return ret;
 }
 
-/* returns a locally allocated string containing the HTML representation of
+/* returns a locally allocated string containing the ASCII representation of
  * the number 'n' in decimal. Up to NB_ITOA_STR calls may be used in the same
  * function call (eg: printf), shared with the other similar functions making
  * use of itoa_str[].
@@ -364,7 +352,7 @@ extern const char *invalid_prefix_char(const char *name);
  * IPv6, use ":::port". NULL is returned if the host part cannot be resolved.
  * If <pfx> is non-null, it is used as a string prefix before any path-based
  * address (typically the path to a unix socket). If use_dns is not true,
- * the funtion cannot accept the DNS resolution.
+ * the function cannot accept the DNS resolution.
  */
 struct sockaddr_storage *str2sa_range(const char *str,
                                       int *port, int *low, int *high,
@@ -376,6 +364,12 @@ struct sockaddr_storage *str2sa_range(const char *str,
  * if the conversion succeeds otherwise zero.
  */
 int str2mask(const char *str, struct in_addr *mask);
+
+/* converts <str> to a struct in6_addr containing a network mask. It can be
+ * passed in quadruplet form (ffff:ffff::) or in CIDR form (64). It returns 1
+ * if the conversion succeeds otherwise zero.
+ */
+int str2mask6(const char *str, struct in6_addr *mask);
 
 /* convert <cidr> to struct in_addr <mask>. It returns 1 if the conversion
  * succeeds otherwise non-zero.
@@ -439,7 +433,7 @@ int url2sa(const char *url, int ulen, struct sockaddr_storage *addr, struct spli
  * is returned upon error, with errno set. AF_INET, AF_INET6 and AF_UNIX are
  * supported.
  */
-int addr_to_str(struct sockaddr_storage *addr, char *str, int size);
+int addr_to_str(const struct sockaddr_storage *addr, char *str, int size);
 
 /* Tries to convert a sockaddr_storage port to text form. Upon success, the
  * address family is returned so that it's easy for the caller to adapt to the
@@ -447,7 +441,7 @@ int addr_to_str(struct sockaddr_storage *addr, char *str, int size);
  * is returned upon error, with errno set. AF_INET, AF_INET6 and AF_UNIX are
  * supported.
  */
-int port_to_str(struct sockaddr_storage *addr, char *str, int size);
+int port_to_str(const struct sockaddr_storage *addr, char *str, int size);
 
 /* check if the given address is local to the system or not. It will return
  * -1 when it's not possible to know, 0 when the address is not local, 1 when
@@ -472,15 +466,15 @@ int addr_is_local(const struct netns_entry *ns,
  */
 extern const char hextab[];
 char *encode_string(char *start, char *stop,
-		    const char escape, const fd_set *map,
+		    const char escape, const long *map,
 		    const char *string);
 
 /*
  * Same behavior, except that it encodes chunk <chunk> instead of a string.
  */
 char *encode_chunk(char *start, char *stop,
-                   const char escape, const fd_set *map,
-                   const struct chunk *chunk);
+                   const char escape, const long *map,
+                   const struct buffer *chunk);
 
 /*
  * Tries to prefix characters tagged in the <map> with the <escape>
@@ -491,7 +485,7 @@ char *encode_chunk(char *start, char *stop,
  * completes.
  */
 char *escape_string(char *start, char *stop,
-		    const char escape, const fd_set *map,
+		    const char escape, const long *map,
 		    const char *string);
 
 /*
@@ -502,8 +496,8 @@ char *escape_string(char *start, char *stop,
  * <stop>, and will return its position if the conversion completes.
  */
 char *escape_chunk(char *start, char *stop,
-                   const char escape, const fd_set *map,
-                   const struct chunk *chunk);
+                   const char escape, const long *map,
+                   const struct buffer *chunk);
 
 
 /* Check a string for using it in a CSV output format. If the string contains
@@ -533,10 +527,11 @@ char *escape_chunk(char *start, char *stop,
  * This function appends the encoding to the existing output chunk. Please
  * use csv_enc() instead if you want to replace the output chunk.
  */
-const char *csv_enc_append(const char *str, int quote, struct chunk *output);
+const char *csv_enc_append(const char *str, int quote, struct buffer *output);
 
 /* same as above but the output chunk is reset first */
-static inline const char *csv_enc(const char *str, int quote, struct chunk *output)
+static inline const char *csv_enc(const char *str, int quote,
+				  struct buffer *output)
 {
 	chunk_reset(output);
 	return csv_enc_append(str, quote, output);
@@ -742,6 +737,10 @@ extern time_t my_timegm(const struct tm *tm);
 extern const char *parse_time_err(const char *text, unsigned *ret, unsigned unit_flags);
 extern const char *parse_size_err(const char *text, unsigned *ret);
 
+/* special return values for the time parser */
+#define PARSE_TIME_UNDER ((char *)1)
+#define PARSE_TIME_OVER  ((char *)2)
+
 /* unit flags to pass to parse_time_err */
 #define TIME_UNIT_US   0x0000
 #define TIME_UNIT_MS   0x0001
@@ -782,25 +781,34 @@ static inline unsigned int div64_32(unsigned long long o1, unsigned int o2)
 	return result;
 }
 
-/* Simple popcountl implementation. It returns the number of ones in a word */
+/* Simple popcountl implementation. It returns the number of ones in a word.
+ * Described here : https://graphics.stanford.edu/~seander/bithacks.html
+ */
 static inline unsigned int my_popcountl(unsigned long a)
 {
-	unsigned int cnt;
-	for (cnt = 0; a; a >>= 1) {
-		if (a & 1)
-			cnt++;
-	}
-	return cnt;
+	a = a - ((a >> 1) & ~0UL/3);
+	a = (a & ~0UL/15*3) + ((a >> 2) & ~0UL/15*3);
+	a = (a + (a >> 4)) & ~0UL/255*15;
+	return (unsigned long)(a * (~0UL/255)) >> (sizeof(unsigned long) - 1) * 8;
+}
+
+/* returns non-zero if <a> has at least 2 bits set */
+static inline unsigned long atleast2(unsigned long a)
+{
+	return a & (a - 1);
 }
 
 /* Simple ffs implementation. It returns the position of the lowest bit set to
- * one. */
+ * one, starting at 1. It is illegal to call it with a==0 (undefined result).
+ */
 static inline unsigned int my_ffsl(unsigned long a)
 {
-	unsigned int cnt;
+	unsigned long cnt;
 
-	if (!a)
-		return 0;
+#if defined(__x86_64__)
+	__asm__("bsf %1,%0\n" : "=r" (cnt) : "rm" (a));
+	cnt++;
+#else
 
 	cnt = 1;
 #if LONG_MAX > 0x7FFFFFFFL /* 64bits */
@@ -829,6 +837,51 @@ static inline unsigned int my_ffsl(unsigned long a)
 		a >>= 1;
 		cnt += 1;
 	}
+#endif /* x86_64 */
+
+	return cnt;
+}
+
+/* Simple fls implementation. It returns the position of the highest bit set to
+ * one, starting at 1. It is illegal to call it with a==0 (undefined result).
+ */
+static inline unsigned int my_flsl(unsigned long a)
+{
+	unsigned long cnt;
+
+#if defined(__x86_64__)
+	__asm__("bsr %1,%0\n" : "=r" (cnt) : "rm" (a));
+	cnt++;
+#else
+
+	cnt = 1;
+#if LONG_MAX > 0x7FFFFFFFUL /* 64bits */
+	if (a & 0xFFFFFFFF00000000UL) {
+		a >>= 32;
+		cnt += 32;
+	}
+#endif
+	if (a & 0XFFFF0000U) {
+		a >>= 16;
+		cnt += 16;
+	}
+	if (a & 0XFF00) {
+		a >>= 8;
+		cnt += 8;
+	}
+	if (a & 0xf0) {
+		a >>= 4;
+		cnt += 4;
+	}
+	if (a & 0xc) {
+		a >>= 2;
+		cnt += 2;
+	}
+	if (a & 0x2) {
+		a >>= 1;
+		cnt += 1;
+	}
+#endif /* x86_64 */
 
 	return cnt;
 }
@@ -840,6 +893,30 @@ static inline unsigned long nbits(int bits)
 		return 0;
 	else
 		return (2UL << bits) - 1;
+}
+
+/* sets bit <bit> into map <map>, which must be long-aligned */
+static inline void ha_bit_set(unsigned long bit, long *map)
+{
+	map[bit / (8 * sizeof(*map))] |= 1UL << (bit & (8 * sizeof(*map) - 1));
+}
+
+/* clears bit <bit> from map <map>, which must be long-aligned */
+static inline void ha_bit_clr(unsigned long bit, long *map)
+{
+	map[bit / (8 * sizeof(*map))] &= ~(1UL << (bit & (8 * sizeof(*map) - 1)));
+}
+
+/* flips bit <bit> from map <map>, which must be long-aligned */
+static inline void ha_bit_flip(unsigned long bit, long *map)
+{
+	map[bit / (8 * sizeof(*map))] ^= 1UL << (bit & (8 * sizeof(*map) - 1));
+}
+
+/* returns non-zero if bit <bit> from map <map> is set, otherwise 0 */
+static inline int ha_bit_test(unsigned long bit, const long *map)
+{
+	return !!(map[bit / (8 * sizeof(*map))] & 1UL << (bit & (8 * sizeof(*map) - 1)));
 }
 
 /*
@@ -920,6 +997,20 @@ static inline unsigned int __full_hash(unsigned int a)
 	return a * 3221225473U;
 }
 
+/* Return the bit position in mask <m> of the nth bit set of rank <r>, between
+ * 0 and LONGBITS-1 included, starting from the left. For example ranks 0,1,2,3
+ * for mask 0x55 will be 6, 4, 2 and 0 respectively. This algorithm is based on
+ * a popcount variant and is described here :
+ *   https://graphics.stanford.edu/~seander/bithacks.html
+ */
+unsigned int mask_find_rank_bit(unsigned int r, unsigned long m);
+unsigned int mask_find_rank_bit_fast(unsigned int r, unsigned long m,
+                                     unsigned long a, unsigned long b,
+                                     unsigned long c, unsigned long d);
+void mask_prep_rank_map(unsigned long m,
+                        unsigned long *a, unsigned long *b,
+                        unsigned long *c, unsigned long *d);
+
 /* sets the address family to AF_UNSPEC so that is_addr() does not match */
 static inline void clear_addr(struct sockaddr_storage *addr)
 {
@@ -949,7 +1040,7 @@ static inline int is_inet_addr(const struct sockaddr_storage *addr)
  */
 static inline int is_addr(const struct sockaddr_storage *addr)
 {
-	if (addr->ss_family == AF_UNIX)
+	if (addr->ss_family == AF_UNIX || addr->ss_family == AF_CUST_SOCKPAIR)
 		return 1;
 	else
 		return is_inet_addr(addr);
@@ -1037,10 +1128,10 @@ extern int in_net_ipv4(const void *addr, const struct in_addr *mask, const struc
 /* Return true if IPv6 address is part of the network */
 extern int in_net_ipv6(const void *addr, const struct in6_addr *mask, const struct in6_addr *net);
 
-/* Map IPv4 adress on IPv6 address, as specified in RFC 3513. */
+/* Map IPv4 address on IPv6 address, as specified in RFC 3513. */
 extern void v4tov6(struct in6_addr *sin6_addr, struct in_addr *sin_addr);
 
-/* Map IPv6 adress on IPv4 address, as specified in RFC 3513.
+/* Map IPv6 address on IPv4 address, as specified in RFC 3513.
  * Return true if conversion is possible and false otherwise.
  */
 extern int v6tov4(struct in_addr *sin_addr, struct in6_addr *sin6_addr);
@@ -1069,7 +1160,7 @@ extern const char *monthname[];
  * without using sprintf. return a pointer to the last char written (\0) or
  * NULL if there isn't enough space.
  */
-char *date2str_log(char *dest, struct tm *tm, struct timeval *date, size_t size);
+char *date2str_log(char *dest, const struct tm *tm, const struct timeval *date, size_t size);
 
 /* Return the GMT offset for a specific local time.
  * Both t and tm must represent the same time.
@@ -1148,6 +1239,16 @@ char *memprintf(char **out, const char *format, ...)
  */
 char *indent_msg(char **out, int level);
 
+/* removes environment variable <name> from the environment as found in
+ * environ. This is only provided as an alternative for systems without
+ * unsetenv() (old Solaris and AIX versions). THIS IS NOT THREAD SAFE.
+ * The principle is to scan environ for each occurence of variable name
+ * <name> and to replace the matching pointers with the last pointer of
+ * the array (since variables are not ordered).
+ * It always returns 0 (success).
+ */
+int my_unsetenv(const char *name);
+
 /* Convert occurrences of environment variables in the input string to their
  * corresponding value. A variable is identified as a series of alphanumeric
  * characters or underscores following a '$' sign. The <in> string must be
@@ -1187,6 +1288,24 @@ static inline void shut_your_big_mouth_gcc(int r)
 /* same as strstr() but case-insensitive */
 const char *strnistr(const char *str1, int len_str1, const char *str2, int len_str2);
 
+/* after increasing a pointer value, it can exceed the first buffer
+ * size. This function transform the value of <ptr> according with
+ * the expected position. <chunks> is an array of the one or two
+ * available chunks. The first value is the start of the first chunk,
+ * the second value if the end+1 of the first chunks. The third value
+ * is NULL or the start of the second chunk and the fourth value is
+ * the end+1 of the second chunk. The function returns 1 if does a
+ * wrap, else returns 0.
+ */
+static inline int fix_pointer_if_wrap(const char **chunks, const char **ptr)
+{
+	if (*ptr < chunks[1])
+		return 0;
+	if (!chunks[2])
+		return 0;
+	*ptr = chunks[2] + ( *ptr - chunks[1] );
+	return 1;
+}
 
 /************************* Composite address manipulation *********************
  * Composite addresses are simply unsigned long data in which the higher bits
@@ -1315,10 +1434,12 @@ static inline unsigned long long rdtsc()
 struct list;
 int list_append_word(struct list *li, const char *str, char **err);
 
-int dump_text(struct chunk *out, const char *buf, int bsize);
-int dump_binary(struct chunk *out, const char *buf, int bsize);
-int dump_text_line(struct chunk *out, const char *buf, int bsize, int len,
+int dump_text(struct buffer *out, const char *buf, int bsize);
+int dump_binary(struct buffer *out, const char *buf, int bsize);
+int dump_text_line(struct buffer *out, const char *buf, int bsize, int len,
                    int *line, int ptr);
+void dump_hex(struct buffer *out, const char *pfx, const void *buf, int len, int unsafe);
+int may_access(const void *ptr);
 
 /* same as realloc() except that ptr is also freed upon failure */
 static inline void *my_realloc2(void *ptr, size_t size)
@@ -1330,6 +1451,8 @@ static inline void *my_realloc2(void *ptr, size_t size)
 		free(ptr);
 	return ret;
 }
+
+int parse_dotted_uints(const char *s, unsigned int **nums, size_t *sz);
 
 /* HAP_STRING() makes a string from a literal while HAP_XSTRING() first
  * evaluates the argument and is suited to pass macros.

@@ -22,6 +22,7 @@
 #ifndef _TYPES_APPLET_H
 #define _TYPES_APPLET_H
 
+#include <types/freq_ctr.h>
 #include <types/hlua.h>
 #include <types/obj_type.h>
 #include <types/proxy.h>
@@ -45,19 +46,19 @@ struct applet {
 	unsigned int timeout;              /* execution timeout. */
 };
 
-#define APPLET_SLEEPING     0x00  /* applet is currently sleeping or pending in active queue */
-#define APPLET_RUNNING      0x01  /* applet is currently running */
-#define APPLET_WOKEN_UP     0x02  /* applet was running and requested to woken up again */
-#define APPLET_WANT_DIE     0x04  /* applet was running and requested to die */
+#define APPLET_WANT_DIE     0x01  /* applet was running and requested to die */
+
+#define APPCTX_CLI_ST1_PROMPT  (1 << 0)
+#define APPCTX_CLI_ST1_PAYLOAD (1 << 1)
 
 /* Context of a running applet. */
 struct appctx {
-	struct list runq;          /* chaining in the applet run queue */
 	enum obj_type obj_type;    /* OBJ_TYPE_APPCTX */
 	/* 3 unused bytes here */
 	unsigned short state;      /* Internal appctx state */
 	unsigned int st0;          /* CLI state for stats, session state for peers */
-	unsigned int st1;          /* prompt for stats, session error for peers */
+	unsigned int st1;          /* prompt/payload (bitwise OR of APPCTX_CLI_ST1_*) for stats, session error for peers */
+	struct buffer *chunk;       /* used to store unfinished commands */
 	unsigned int st2;          /* output state for stats, unused by peers  */
 	struct applet *applet;     /* applet this context refers to */
 	void *owner;               /* pointer to upper layer's entity (eg: stream interface) */
@@ -66,8 +67,11 @@ struct appctx {
 	void (*io_release)(struct appctx *appctx);  /* used within the cli_io_handler when st0 = CLI_ST_CALLBACK,
 	                                               if the command is terminated or the session released */
 	int cli_severity_output;        /* used within the cli_io_handler to format severity output of informational feedback */
+	int cli_level;              /* the level of CLI which can be lowered dynamically */
 	struct buffer_wait buffer_wait; /* position in the list of objects waiting for a buffer */
 	unsigned long thread_mask;      /* mask of thread IDs authorized to process the applet */
+	struct task *t;                  /* task associated to the applet */
+	struct freq_ctr call_rate;       /* appctx call rate */
 
 	union {
 		struct {
@@ -104,7 +108,11 @@ struct appctx {
 			int i0, i1;             /* to 0 by the CLI before first invocation of the keyword parser. */
 		} cli;                          /* context used by the CLI */
 		struct {
-			struct cache_entry *entry;
+			struct cache_entry *entry;  /* Entry to be sent from cache. */
+			unsigned int sent;          /* The number of bytes already sent for this cache entry. */
+			unsigned int offset;        /* start offset of remaining data relative to beginning of the next block */
+			unsigned int rem_data;      /* Remaing bytes for the last data block (HTX only, 0 means process next block) */
+			struct shared_block *next;  /* The next block of data to be sent for this cache entry. */
 		} cache;
 		/* all entries below are used by various CLI commands, please
 		 * keep the grouped together and avoid adding new ones.
@@ -131,13 +139,13 @@ struct appctx {
 			int iid;		/* if >= 0, ID of the proxy to filter on */
 			struct proxy *px;	/* current proxy being dumped, NULL = not started yet. */
 			unsigned int flag;	/* bit0: buffer being dumped, 0 = req, 1 = resp ; bit1=skip req ; bit2=skip resp. */
-			unsigned int sid;	/* session ID of error being dumped */
+			unsigned int ev_id;	/* event ID of error being dumped */
 			int ptr;		/* <0: headers, >=0 : text pointer to restart from */
 			int bol;		/* pointer to beginning of current line */
 		} errors;
 		struct {
 			void *target;		/* table we want to dump, or NULL for all */
-			struct proxy *proxy;	/* table being currently dumped (first if NULL) */
+			struct stktable *t;	/* table being currently dumped (first if NULL) */
 			struct stksess *entry;	/* last entry we were trying to dump (or first if NULL) */
 			long long value;	/* value to compare against */
 			signed char data_type;	/* type of data to compare, or -1 if none */
@@ -149,13 +157,18 @@ struct appctx {
 			struct pat_ref *ref;
 			struct bref bref;	/* back-reference from the pat_ref_elt being dumped */
 			struct pattern_expr *expr;
-			struct chunk chunk;
+			struct buffer chunk;
 		} map;
 		struct {
 			struct hlua *hlua;
 			struct task *task;
 			struct hlua_function *fcn;
 		} hlua_cli;
+		struct {
+			void *target;
+			struct peers *peers; /* "peers" section being currently dumped. */
+			struct peer *peer;   /* "peer" being currently dumped. */
+		} cfgpeers;
 		/* NOTE: please add regular applet contexts (ie: not
 		 * CLI-specific ones) above, before "cli".
 		 */

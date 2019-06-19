@@ -36,10 +36,17 @@
 #include <proto/log.h>
 #include <proto/freq_ctr.h>
 
+
+__decl_hathreads(extern HA_SPINLOCK_T idle_conn_srv_lock);
+extern struct eb_root idle_conn_srv;
+extern struct task *idle_conn_task;
+extern struct task *idle_conn_cleanup[MAX_THREADS];
+extern struct list toremove_connections[MAX_THREADS];
+
 int srv_downtime(const struct server *s);
 int srv_lastsession(const struct server *s);
 int srv_getinter(const struct check *check);
-int parse_server(const char *file, int linenum, char **args, struct proxy *curproxy, struct proxy *defproxy);
+int parse_server(const char *file, int linenum, char **args, struct proxy *curproxy, struct proxy *defproxy, int parse_addr);
 int update_server_addr(struct server *s, void *ip, int ip_sin_family, const char *updater);
 const char *update_server_addr_port(struct server *s, const char *addr, const char *port, char *updater);
 struct server *server_find_by_id(struct proxy *bk, int id);
@@ -50,9 +57,7 @@ void srv_compute_all_admin_states(struct proxy *px);
 int srv_set_addr_via_libc(struct server *srv, int *err_code);
 int srv_init_addr(void);
 struct server *cli_find_server(struct appctx *appctx, char *arg);
-void servers_update_status(void);
-
-extern struct list updated_servers;
+struct server *new_server(struct proxy *proxy);
 
 /* functions related to server name resolution */
 int snr_update_srv_status(struct server *s, int has_no_ip);
@@ -60,17 +65,19 @@ const char *update_server_fqdn(struct server *server, const char *fqdn, const ch
 int snr_resolution_cb(struct dns_requester *requester, struct dns_nameserver *nameserver);
 int snr_resolution_error_cb(struct dns_requester *requester, int error_code);
 struct server *snr_check_ip_callback(struct server *srv, void *ip, unsigned char *ip_family);
+struct task *srv_cleanup_idle_connections(struct task *task, void *ctx, unsigned short state);
+struct task *srv_cleanup_toremove_connections(struct task *task, void *context, unsigned short state);
 
 /* increase the number of cumulated connections on the designated server */
-static void inline srv_inc_sess_ctr(struct server *s)
+static inline void srv_inc_sess_ctr(struct server *s)
 {
-	HA_ATOMIC_ADD(&s->counters.cum_sess, 1);
+	_HA_ATOMIC_ADD(&s->counters.cum_sess, 1);
 	HA_ATOMIC_UPDATE_MAX(&s->counters.sps_max,
 			     update_freq_ctr(&s->sess_per_sec, 1));
 }
 
 /* set the time of last session on the designated server */
-static void inline srv_set_sess_last(struct server *s)
+static inline void srv_set_sess_last(struct server *s)
 {
 	s->counters.last_sess = now.tv_sec;
 }
@@ -91,7 +98,7 @@ void srv_dump_kws(char **out);
  * and the proxy's algorihtm. To be used after updating sv->uweight. The warmup
  * state is automatically disabled if the time is elapsed.
  */
-void server_recalc_eweight(struct server *sv);
+void server_recalc_eweight(struct server *sv, int must_update);
 
 /* returns the current server throttle rate between 0 and 100% */
 static inline unsigned int server_throttle_rate(struct server *sv)
@@ -150,7 +157,8 @@ void srv_shutdown_streams(struct server *srv, int why);
  */
 void srv_shutdown_backup_streams(struct proxy *px, int why);
 
-void srv_append_status(struct chunk *msg, struct server *s, struct check *, int xferred, int forced);
+void srv_append_status(struct buffer *msg, struct server *s, struct check *,
+		       int xferred, int forced);
 
 void srv_set_stopped(struct server *s, const char *reason, struct check *check);
 void srv_set_running(struct server *s, const char *reason, struct check *check);
@@ -232,6 +240,50 @@ static inline enum srv_initaddr srv_get_next_initaddr(unsigned int *list)
 	ret = *list & 7;
 	*list >>= 3;
 	return ret;
+}
+
+/* This adds an idle connection to the server's list if the connection is
+ * reusable, not held by any owner anymore, but still has available streams.
+ */
+static inline int srv_add_to_idle_list(struct server *srv, struct connection *conn)
+{
+	if (srv && srv->pool_purge_delay > 0 &&
+	    (srv->max_idle_conns == -1 || srv->max_idle_conns > srv->curr_idle_conns) &&
+	    !(conn->flags & CO_FL_PRIVATE) &&
+	    ((srv->proxy->options & PR_O_REUSE_MASK) != PR_O_REUSE_NEVR) &&
+	    !conn->mux->used_streams(conn) && conn->mux->avail_streams(conn) &&
+	    ha_used_fds < global.tune.pool_low_count) {
+		int retadd;
+
+		retadd = _HA_ATOMIC_ADD(&srv->curr_idle_conns, 1);
+		if (retadd >= srv->max_idle_conns) {
+			_HA_ATOMIC_SUB(&srv->curr_idle_conns, 1);
+			return 0;
+		}
+		LIST_DEL(&conn->list);
+		LIST_ADDQ_LOCKED(&srv->idle_orphan_conns[tid], &conn->list);
+		srv->curr_idle_thr[tid]++;
+
+		conn->idle_time = now_ms;
+		__ha_barrier_full();
+		if ((volatile void *)srv->idle_node.node.leaf_p == NULL) {
+			HA_SPIN_LOCK(OTHER_LOCK, &idle_conn_srv_lock);
+			if ((volatile void *)srv->idle_node.node.leaf_p == NULL) {
+				srv->idle_node.key = tick_add(srv->pool_purge_delay,
+				                              now_ms);
+				eb32_insert(&idle_conn_srv, &srv->idle_node);
+				if (!task_in_wq(idle_conn_task) && !
+				    task_in_rq(idle_conn_task)) {
+					task_schedule(idle_conn_task,
+					              srv->idle_node.key);
+				}
+
+			}
+			HA_SPIN_UNLOCK(OTHER_LOCK, &idle_conn_srv_lock);
+		}
+		return 1;
+	}
+	return 0;
 }
 
 #endif /* _PROTO_SERVER_H */

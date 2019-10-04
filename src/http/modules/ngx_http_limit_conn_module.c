@@ -71,7 +71,9 @@ static ngx_conf_num_bounds_t  ngx_http_limit_conn_status_bounds = {
     ngx_conf_check_num_bounds, 400, 599
 };
 
-
+/**
+ * 配置选择项
+ */ 
 static ngx_command_t  ngx_http_limit_conn_commands[] = {
 
     { ngx_string("limit_conn_zone"),
@@ -448,6 +450,9 @@ ngx_http_limit_conn_init_zone(ngx_shm_zone_t *shm_zone, void *data)
 }
 
 
+/**
+ * 创建配置文件
+ */ 
 static void *
 ngx_http_limit_conn_create_conf(ngx_conf_t *cf)
 {
@@ -470,7 +475,10 @@ ngx_http_limit_conn_create_conf(ngx_conf_t *cf)
     return conf;
 }
 
-
+/**
+ * 
+ * 合并limit_conn配置结构体
+ */ 
 static char *
 ngx_http_limit_conn_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -589,7 +597,9 @@ ngx_http_limit_conn_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * 连接次数
+ */ 
 static char *
 ngx_http_limit_conn(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -650,7 +660,9 @@ ngx_http_limit_conn(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * 初始化limit conn
+ */ 
 static ngx_int_t
 ngx_http_limit_conn_init(ngx_conf_t *cf)
 {

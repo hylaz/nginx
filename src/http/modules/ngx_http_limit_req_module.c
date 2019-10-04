@@ -136,7 +136,9 @@ static ngx_http_module_t  ngx_http_limit_req_module_ctx = {
     ngx_http_limit_req_merge_conf          /* merge location configuration */
 };
 
-
+/**
+ * limit_req_module结构体
+ */ 
 ngx_module_t  ngx_http_limit_req_module = {
     NGX_MODULE_V1,
     &ngx_http_limit_req_module_ctx,        /* module context */
@@ -283,7 +285,9 @@ ngx_http_limit_req_handler(ngx_http_request_t *r)
     return NGX_AGAIN;
 }
 
-
+/**
+ * 请求禁用
+ */ 
 static void
 ngx_http_limit_req_delay(ngx_http_request_t *r)
 {
@@ -626,7 +630,9 @@ ngx_http_limit_req_expire(ngx_http_limit_req_ctx_t *ctx, ngx_uint_t n)
     }
 }
 
-
+/**
+ * 
+ */ 
 static ngx_int_t
 ngx_http_limit_req_init_zone(ngx_shm_zone_t *shm_zone, void *data)
 {
@@ -692,7 +698,9 @@ ngx_http_limit_req_init_zone(ngx_shm_zone_t *shm_zone, void *data)
     return NGX_OK;
 }
 
-
+/**
+ * 创建ngx_http_limit_req_conf_t配置结构体
+ */ 
 static void *
 ngx_http_limit_req_create_conf(ngx_conf_t *cf)
 {
@@ -715,7 +723,10 @@ ngx_http_limit_req_create_conf(ngx_conf_t *cf)
     return conf;
 }
 
-
+/**
+ * 
+ * 合并配置项
+ */ 
 static char *
 ngx_http_limit_req_merge_conf(ngx_conf_t *cf, void *parent, void *child)
 {
@@ -738,7 +749,9 @@ ngx_http_limit_req_merge_conf(ngx_conf_t *cf, void *parent, void *child)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * req_zone配置项
+ */ 
 static char *
 ngx_http_limit_req_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -869,7 +882,10 @@ ngx_http_limit_req_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * 
+ * limit_req配置项
+ */ 
 static char *
 ngx_http_limit_req(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
@@ -961,7 +977,10 @@ ngx_http_limit_req(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
-
+/**
+ * 
+ * 请求初始化
+ */ 
 static ngx_int_t
 ngx_http_limit_req_init(ngx_conf_t *cf)
 {

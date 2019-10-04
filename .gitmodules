@@ -121,3 +121,6 @@
 [submodule "module/nginx-module-sts"]
 	path = module/nginx-module-sts
 	url = https://github.com/vozlt/nginx-module-sts
+[submodule "module/ngx_http_dyups_module"]
+	path = module/ngx_http_dyups_module
+	url = https://github.com/yzprofile/ngx_http_dyups_module.git
